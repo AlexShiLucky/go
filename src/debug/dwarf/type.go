@@ -1,4 +1,4 @@
-// Copyright 2009 The Go Authors.  All rights reserved.
+// Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -154,7 +154,7 @@ type StructField struct {
 	Name       string
 	Type       Type
 	ByteOffset int64
-	ByteSize   int64
+	ByteSize   int64 // usually zero; use Type.Size() for normal fields
 	BitOffset  int64 // within the ByteSize bytes at ByteOffset
 	BitSize    int64 // zero if not a bit field
 }
@@ -261,6 +261,20 @@ func (t *TypedefType) String() string { return t.Name }
 
 func (t *TypedefType) Size() int64 { return t.Type.Size() }
 
+// An UnsupportedType is a placeholder returned in situations where we
+// encounter a type that isn't supported.
+type UnsupportedType struct {
+	CommonType
+	Tag Tag
+}
+
+func (t *UnsupportedType) String() string {
+	if t.Name != "" {
+		return t.Name
+	}
+	return t.Name + "(unsupported type " + t.Tag.String() + ")"
+}
+
 // typeReader is used to read from either the info section or the
 // types section.
 type typeReader interface {
@@ -275,12 +289,38 @@ type typeReader interface {
 
 // Type reads the type at off in the DWARF ``info'' section.
 func (d *Data) Type(off Offset) (Type, error) {
-	return d.readType("info", d.Reader(), off, d.typeCache)
+	return d.readType("info", d.Reader(), off, d.typeCache, nil)
 }
 
-// readType reads a type from r at off of name using and updating a
-// type cache.
-func (d *Data) readType(name string, r typeReader, off Offset, typeCache map[Offset]Type) (Type, error) {
+type typeFixer struct {
+	typedefs   []*TypedefType
+	arraytypes []*Type
+}
+
+func (tf *typeFixer) recordArrayType(t *Type) {
+	if t == nil {
+		return
+	}
+	_, ok := (*t).(*ArrayType)
+	if ok {
+		tf.arraytypes = append(tf.arraytypes, t)
+	}
+}
+
+func (tf *typeFixer) apply() {
+	for _, t := range tf.typedefs {
+		t.Common().ByteSize = t.Type.Size()
+	}
+	for _, t := range tf.arraytypes {
+		zeroArray(t)
+	}
+}
+
+// readType reads a type from r at off of name. It adds types to the
+// type cache, appends new typedef types to typedefs, and computes the
+// sizes of types. Callers should pass nil for typedefs; this is used
+// for internal recursion.
+func (d *Data) readType(name string, r typeReader, off Offset, typeCache map[Offset]Type, fixups *typeFixer) (Type, error) {
 	if t, ok := typeCache[off]; ok {
 		return t, nil
 	}
@@ -294,9 +334,22 @@ func (d *Data) readType(name string, r typeReader, off Offset, typeCache map[Off
 		return nil, DecodeError{name, off, "no type at offset"}
 	}
 
+	// If this is the root of the recursion, prepare to resolve
+	// typedef sizes and perform other fixups once the recursion is
+	// done. This must be done after the type graph is constructed
+	// because it may need to resolve cycles in a different order than
+	// readType encounters them.
+	if fixups == nil {
+		var fixer typeFixer
+		defer func() {
+			fixer.apply()
+		}()
+		fixups = &fixer
+	}
+
 	// Parse type from Entry.
 	// Must always set typeCache[off] before calling
-	// d.Type recursively, to handle circular types correctly.
+	// d.readType recursively, to handle circular types correctly.
 	var typ Type
 
 	nextDepth := 0
@@ -339,13 +392,13 @@ func (d *Data) readType(name string, r typeReader, off Offset, typeCache map[Off
 	}
 
 	// Get Type referred to by Entry's AttrType field.
-	// Set err if error happens.  Not having a type is an error.
+	// Set err if error happens. Not having a type is an error.
 	typeOf := func(e *Entry) Type {
 		tval := e.Val(AttrType)
 		var t Type
 		switch toff := tval.(type) {
 		case Offset:
-			if t, err = d.readType(name, r.clone(), toff, typeCache); err != nil {
+			if t, err = d.readType(name, r.clone(), toff, typeCache, fixups); err != nil {
 				return nil
 			}
 		case uint64:
@@ -497,54 +550,55 @@ func (d *Data) readType(name string, r typeReader, off Offset, typeCache map[Off
 		var lastFieldType *Type
 		var lastFieldBitOffset int64
 		for kid := next(); kid != nil; kid = next() {
-			if kid.Tag == TagMember {
-				f := new(StructField)
-				if f.Type = typeOf(kid); err != nil {
+			if kid.Tag != TagMember {
+				continue
+			}
+			f := new(StructField)
+			if f.Type = typeOf(kid); err != nil {
+				goto Error
+			}
+			switch loc := kid.Val(AttrDataMemberLoc).(type) {
+			case []byte:
+				// TODO: Should have original compilation
+				// unit here, not unknownFormat.
+				b := makeBuf(d, unknownFormat{}, "location", 0, loc)
+				if b.uint8() != opPlusUconst {
+					err = DecodeError{name, kid.Offset, "unexpected opcode"}
 					goto Error
 				}
-				switch loc := kid.Val(AttrDataMemberLoc).(type) {
-				case []byte:
-					// TODO: Should have original compilation
-					// unit here, not unknownFormat.
-					b := makeBuf(d, unknownFormat{}, "location", 0, loc)
-					if b.uint8() != opPlusUconst {
-						err = DecodeError{name, kid.Offset, "unexpected opcode"}
-						goto Error
-					}
-					f.ByteOffset = int64(b.uint())
-					if b.err != nil {
-						err = b.err
-						goto Error
-					}
-				case int64:
-					f.ByteOffset = loc
+				f.ByteOffset = int64(b.uint())
+				if b.err != nil {
+					err = b.err
+					goto Error
 				}
-
-				haveBitOffset := false
-				f.Name, _ = kid.Val(AttrName).(string)
-				f.ByteSize, _ = kid.Val(AttrByteSize).(int64)
-				f.BitOffset, haveBitOffset = kid.Val(AttrBitOffset).(int64)
-				f.BitSize, _ = kid.Val(AttrBitSize).(int64)
-				t.Field = append(t.Field, f)
-
-				bito := f.BitOffset
-				if !haveBitOffset {
-					bito = f.ByteOffset * 8
-				}
-				if bito == lastFieldBitOffset && t.Kind != "union" {
-					// Last field was zero width.  Fix array length.
-					// (DWARF writes out 0-length arrays as if they were 1-length arrays.)
-					zeroArray(lastFieldType)
-				}
-				lastFieldType = &f.Type
-				lastFieldBitOffset = bito
+			case int64:
+				f.ByteOffset = loc
 			}
+
+			haveBitOffset := false
+			f.Name, _ = kid.Val(AttrName).(string)
+			f.ByteSize, _ = kid.Val(AttrByteSize).(int64)
+			f.BitOffset, haveBitOffset = kid.Val(AttrBitOffset).(int64)
+			f.BitSize, _ = kid.Val(AttrBitSize).(int64)
+			t.Field = append(t.Field, f)
+
+			bito := f.BitOffset
+			if !haveBitOffset {
+				bito = f.ByteOffset * 8
+			}
+			if bito == lastFieldBitOffset && t.Kind != "union" {
+				// Last field was zero width. Fix array length.
+				// (DWARF writes out 0-length arrays as if they were 1-length arrays.)
+				fixups.recordArrayType(lastFieldType)
+			}
+			lastFieldType = &f.Type
+			lastFieldBitOffset = bito
 		}
 		if t.Kind != "union" {
 			b, ok := e.Val(AttrByteSize).(int64)
 			if ok && b*8 == lastFieldBitOffset {
-				// Final field must be zero width.  Fix array length.
-				zeroArray(lastFieldType)
+				// Final field must be zero width. Fix array length.
+				fixups.recordArrayType(lastFieldType)
 			}
 		}
 
@@ -662,6 +716,16 @@ func (d *Data) readType(name string, r typeReader, off Offset, typeCache map[Off
 		typ = t
 		typeCache[off] = t
 		t.Name, _ = e.Val(AttrName).(string)
+
+	default:
+		// This is some other type DIE that we're currently not
+		// equipped to handle. Return an abstract "unsupported type"
+		// object in such cases.
+		t := new(UnsupportedType)
+		typ = t
+		typeCache[off] = t
+		t.Tag = e.Tag
+		t.Name, _ = e.Val(AttrName).(string)
 	}
 
 	if err != nil {
@@ -674,7 +738,10 @@ func (d *Data) readType(name string, r typeReader, off Offset, typeCache map[Off
 			b = -1
 			switch t := typ.(type) {
 			case *TypedefType:
-				b = t.Type.Size()
+				// Record that we need to resolve this
+				// type's size once the type graph is
+				// constructed.
+				fixups.typedefs = append(fixups.typedefs, t)
 			case *PtrType:
 				b = int64(addressSize)
 			}
@@ -692,11 +759,8 @@ Error:
 }
 
 func zeroArray(t *Type) {
-	if t == nil {
-		return
-	}
-	at, ok := (*t).(*ArrayType)
-	if !ok || at.Type.Size() == 0 {
+	at := (*t).(*ArrayType)
+	if at.Type.Size() == 0 {
 		return
 	}
 	// Make a copy to avoid invalidating typeCache.

@@ -74,7 +74,7 @@ func bench(b *testing.B, dcm, scm, mcm color.Model, op Op) {
 	var src image.Image
 	switch scm {
 	case nil:
-		src = &image.Uniform{C: color.RGBA{0x11, 0x22, 0x33, 0xff}}
+		src = &image.Uniform{C: color.RGBA{0x11, 0x22, 0x33, 0x44}}
 	case color.CMYKModel:
 		src1 := image.NewCMYK(image.Rect(0, 0, srcw, srch))
 		for y := 0; y < srch; y++ {
@@ -236,7 +236,11 @@ func BenchmarkRGBA(b *testing.B) {
 	bench(b, color.RGBAModel, color.RGBA64Model, nil, Src)
 }
 
-func BenchmarkPaletted(b *testing.B) {
+func BenchmarkPalettedFill(b *testing.B) {
+	bench(b, palette, nil, nil, Src)
+}
+
+func BenchmarkPalettedRGBA(b *testing.B) {
 	bench(b, palette, color.RGBAModel, nil, Src)
 }
 

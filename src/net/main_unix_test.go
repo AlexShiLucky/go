@@ -2,17 +2,20 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build darwin dragonfly freebsd linux nacl netbsd openbsd solaris
+//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
+// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris
 
 package net
+
+import "internal/poll"
 
 var (
 	// Placeholders for saving original socket system calls.
 	origSocket        = socketFunc
-	origClose         = closeFunc
+	origClose         = poll.CloseFunc
 	origConnect       = connectFunc
 	origListen        = listenFunc
-	origAccept        = acceptFunc
+	origAccept        = poll.AcceptFunc
 	origGetsockoptInt = getsockoptIntFunc
 
 	extraTestHookInstallers   []func()
@@ -21,10 +24,10 @@ var (
 
 func installTestHooks() {
 	socketFunc = sw.Socket
-	closeFunc = sw.Close
+	poll.CloseFunc = sw.Close
 	connectFunc = sw.Connect
 	listenFunc = sw.Listen
-	acceptFunc = sw.Accept
+	poll.AcceptFunc = sw.Accept
 	getsockoptIntFunc = sw.GetsockoptInt
 
 	for _, fn := range extraTestHookInstallers {
@@ -34,10 +37,10 @@ func installTestHooks() {
 
 func uninstallTestHooks() {
 	socketFunc = origSocket
-	closeFunc = origClose
+	poll.CloseFunc = origClose
 	connectFunc = origConnect
 	listenFunc = origListen
-	acceptFunc = origAccept
+	poll.AcceptFunc = origAccept
 	getsockoptIntFunc = origGetsockoptInt
 
 	for _, fn := range extraTestHookUninstallers {
@@ -45,8 +48,9 @@ func uninstallTestHooks() {
 	}
 }
 
+// forceCloseSockets must be called only from TestMain.
 func forceCloseSockets() {
 	for s := range sw.Sockets() {
-		closeFunc(s)
+		poll.CloseFunc(s)
 	}
 }

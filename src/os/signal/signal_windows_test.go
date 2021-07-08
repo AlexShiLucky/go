@@ -6,7 +6,7 @@ package signal
 
 import (
 	"bytes"
-	"io/ioutil"
+	"internal/testenv"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,11 +56,7 @@ func main() {
 	}
 }
 `
-	tmp, err := ioutil.TempDir("", "TestCtrlBreak")
-	if err != nil {
-		t.Fatal("TempDir failed: ", err)
-	}
-	defer os.RemoveAll(tmp)
+	tmp := t.TempDir()
 
 	// write ctrlbreak.go
 	name := filepath.Join(tmp, "ctlbreak")
@@ -75,7 +71,7 @@ func main() {
 	// compile it
 	exe := name + ".exe"
 	defer os.Remove(exe)
-	o, err := exec.Command("go", "build", "-o", exe, src).CombinedOutput()
+	o, err := exec.Command(testenv.GoToolPath(t), "build", "-o", exe, src).CombinedOutput()
 	if err != nil {
 		t.Fatalf("Failed to compile: %v\n%v", err, string(o))
 	}

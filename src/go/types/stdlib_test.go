@@ -16,7 +16,6 @@ import (
 	"go/scanner"
 	"go/token"
 	"internal/testenv"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -27,27 +26,35 @@ import (
 	. "go/types"
 )
 
-var (
-	pkgCount int // number of packages processed
-	start    time.Time
-
-	// Use the same importer for all std lib tests to
-	// avoid repeated importing of the same packages.
-	stdLibImporter = importer.Default()
-)
+// The cmd/*/internal packages may have been deleted as part of a binary
+// release. Import from source instead.
+//
+// (See https://golang.org/issue/43232 and
+// https://github.com/golang/build/blob/df58bbac082bc87c4a3cdfe336d1ffe60bbaa916/cmd/release/release.go#L533-L545.)
+//
+// Use the same importer for all std lib tests to
+// avoid repeated importing of the same packages.
+var stdLibImporter = importer.ForCompiler(token.NewFileSet(), "source", nil)
 
 func TestStdlib(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
-	start = time.Now()
-	walkDirs(t, filepath.Join(runtime.GOROOT(), "src"))
+	pkgCount := 0
+	duration := walkPkgDirs(filepath.Join(runtime.GOROOT(), "src"), func(dir string, filenames []string) {
+		typecheck(t, dir, filenames)
+		pkgCount++
+	}, t.Error)
+
 	if testing.Verbose() {
-		fmt.Println(pkgCount, "packages typechecked in", time.Since(start))
+		fmt.Println(pkgCount, "packages typechecked in", duration)
 	}
 }
 
-// firstComment returns the contents of the first comment in
-// the given file, assuming there's one within the first KB.
+// firstComment returns the contents of the first non-empty comment in
+// the given file, "skip", or the empty string. No matter the present
+// comments, if any of them contains a build tag, the result is always
+// "skip". Only comments before the "package" token and within the first
+// 4K of the file are considered.
 func firstComment(filename string) string {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -55,11 +62,12 @@ func firstComment(filename string) string {
 	}
 	defer f.Close()
 
-	var src [1 << 10]byte // read at most 1KB
+	var src [4 << 10]byte // read at most 4KB
 	n, _ := f.Read(src[:])
 
+	var first string
 	var s scanner.Scanner
-	s.Init(fset.AddFile("", fset.Base(), n), src[:n], nil, scanner.ScanComments)
+	s.Init(fset.AddFile("", fset.Base(), n), src[:n], nil /* ignore errors */, scanner.ScanComments)
 	for {
 		_, tok, lit := s.Scan()
 		switch tok {
@@ -68,15 +76,23 @@ func firstComment(filename string) string {
 			if lit[1] == '*' {
 				lit = lit[:len(lit)-2]
 			}
-			return strings.TrimSpace(lit[2:])
-		case token.EOF:
-			return ""
+			contents := strings.TrimSpace(lit[2:])
+			if strings.HasPrefix(contents, "+build ") {
+				return "skip"
+			}
+			if first == "" {
+				first = contents // contents may be "" but that's ok
+			}
+			// continue as we may still see build tags
+
+		case token.PACKAGE, token.EOF:
+			return first
 		}
 	}
 }
 
 func testTestDir(t *testing.T, path string, ignore ...string) {
-	files, err := ioutil.ReadDir(path)
+	files, err := os.ReadDir(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,12 +112,28 @@ func testTestDir(t *testing.T, path string, ignore ...string) {
 		// get per-file instructions
 		expectErrors := false
 		filename := filepath.Join(path, f.Name())
-		if cmd := firstComment(filename); cmd != "" {
-			switch cmd {
+		goVersion := ""
+		if comment := firstComment(filename); comment != "" {
+			fields := strings.Fields(comment)
+			switch fields[0] {
 			case "skip", "compiledir":
 				continue // ignore this file
 			case "errorcheck":
 				expectErrors = true
+				for _, arg := range fields[1:] {
+					if arg == "-0" || arg == "-+" || arg == "-std" {
+						// Marked explicitly as not expecting errors (-0),
+						// or marked as compiling runtime/stdlib, which is only done
+						// to trigger runtime/stdlib-only error output.
+						// In both cases, the code should typecheck.
+						expectErrors = false
+						break
+					}
+					const prefix = "-lang="
+					if strings.HasPrefix(arg, prefix) {
+						goVersion = arg[len(prefix):]
+					}
+				}
 			}
 		}
 
@@ -109,6 +141,7 @@ func testTestDir(t *testing.T, path string, ignore ...string) {
 		file, err := parser.ParseFile(fset, filename, nil, 0)
 		if err == nil {
 			conf := Config{Importer: stdLibImporter}
+			SetGoVersion(&conf, goVersion)
 			_, err = conf.Check(filename, fset, []*ast.File{file}, nil)
 		}
 
@@ -127,29 +160,41 @@ func testTestDir(t *testing.T, path string, ignore ...string) {
 func TestStdTest(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
-	// test/recover4.go is only built for Linux and Darwin.
-	// TODO(gri) Remove once tests consider +build tags (issue 10370).
-	if runtime.GOOS != "linux" && runtime.GOOS != "darwin" {
-		return
+	if testing.Short() && testenv.Builder() == "" {
+		t.Skip("skipping in short mode")
 	}
 
 	testTestDir(t, filepath.Join(runtime.GOROOT(), "test"),
 		"cmplxdivide.go", // also needs file cmplxdivide1.go - ignore
-		"sigchld.go",     // don't work on Windows; testTestDir should consult build tags
+		"directive.go",   // tests compiler rejection of bad directive placement - ignore
+		"embedfunc.go",   // tests //go:embed
+		"embedvers.go",   // tests //go:embed
+		"linkname2.go",   // go/types doesn't check validity of //go:xxx directives
 	)
 }
 
 func TestStdFixed(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
 
+	if testing.Short() && testenv.Builder() == "" {
+		t.Skip("skipping in short mode")
+	}
+
 	testTestDir(t, filepath.Join(runtime.GOROOT(), "test", "fixedbugs"),
 		"bug248.go", "bug302.go", "bug369.go", // complex test instructions - ignore
-		"bug459.go",      // possibly incorrect test - see issue 6703 (pending spec clarification)
-		"issue3924.go",   // possibly incorrect test - see issue 6671 (pending spec clarification)
 		"issue6889.go",   // gc-specific test
-		"issue7746.go",   // large constants - consumes too much memory
-		"issue11326.go",  // large constants
-		"issue11326b.go", // large constants
+		"issue11362.go",  // canonical import path check
+		"issue16369.go",  // go/types handles this correctly - not an issue
+		"issue18459.go",  // go/types doesn't check validity of //go:xxx directives
+		"issue18882.go",  // go/types doesn't check validity of //go:xxx directives
+		"issue20529.go",  // go/types does not have constraints on stack size
+		"issue22200.go",  // go/types does not have constraints on stack size
+		"issue22200b.go", // go/types does not have constraints on stack size
+		"issue25507.go",  // go/types does not have constraints on stack size
+		"issue20780.go",  // go/types does not have constraints on stack size
+		"bug251.go",      // issue #34333 which was exposed with fix for #34151
+		"issue42058a.go", // go/types does not have constraints on channel element size
+		"issue42058b.go", // go/types does not have constraints on channel element size
 	)
 }
 
@@ -162,6 +207,9 @@ func TestStdKen(t *testing.T) {
 // Package paths of excluded packages.
 var excluded = map[string]bool{
 	"builtin": true,
+
+	// See #46027: some imports are missing for this submodule.
+	"crypto/ed25519/internal/edwards25519/field/_asm": true,
 }
 
 // typecheck typechecks the given package files.
@@ -201,7 +249,6 @@ func typecheck(t *testing.T, path string, filenames []string) {
 	}
 	info := Info{Uses: make(map[*ast.Ident]Object)}
 	conf.Check(path, fset, files, &info)
-	pkgCount++
 
 	// Perform checks of API invariants.
 
@@ -244,36 +291,48 @@ func pkgFilenames(dir string) ([]string, error) {
 	return filenames, nil
 }
 
-// Note: Could use filepath.Walk instead of walkDirs but that wouldn't
-//       necessarily be shorter or clearer after adding the code to
-//       terminate early for -short tests.
+func walkPkgDirs(dir string, pkgh func(dir string, filenames []string), errh func(args ...interface{})) time.Duration {
+	w := walker{time.Now(), 10 * time.Millisecond, pkgh, errh}
+	w.walk(dir)
+	return time.Since(w.start)
+}
 
-func walkDirs(t *testing.T, dir string) {
+type walker struct {
+	start time.Time
+	dmax  time.Duration
+	pkgh  func(dir string, filenames []string)
+	errh  func(args ...interface{})
+}
+
+func (w *walker) walk(dir string) {
 	// limit run time for short tests
-	if testing.Short() && time.Since(start) >= 750*time.Millisecond {
+	if testing.Short() && time.Since(w.start) >= w.dmax {
 		return
 	}
 
-	fis, err := ioutil.ReadDir(dir)
+	files, err := os.ReadDir(dir)
 	if err != nil {
-		t.Error(err)
+		w.errh(err)
 		return
 	}
 
-	// typecheck package in directory
-	files, err := pkgFilenames(dir)
-	if err != nil {
-		t.Error(err)
-		return
-	}
-	if files != nil {
-		typecheck(t, dir, files)
+	// apply pkgh to the files in directory dir
+	// but ignore files directly under $GOROOT/src (might be temporary test files).
+	if dir != filepath.Join(runtime.GOROOT(), "src") {
+		files, err := pkgFilenames(dir)
+		if err != nil {
+			w.errh(err)
+			return
+		}
+		if files != nil {
+			w.pkgh(dir, files)
+		}
 	}
 
 	// traverse subdirectories, but don't walk into testdata
-	for _, fi := range fis {
-		if fi.IsDir() && fi.Name() != "testdata" {
-			walkDirs(t, filepath.Join(dir, fi.Name()))
+	for _, f := range files {
+		if f.IsDir() && f.Name() != "testdata" {
+			w.walk(filepath.Join(dir, f.Name()))
 		}
 	}
 }

@@ -7,7 +7,7 @@
 //	Portions Copyright © 2004,2006 Bruce Ellis
 //	Portions Copyright © 2005-2007 C H Forsyth (forsyth@terzarima.net)
 //	Revisions Copyright © 2000-2008 Lucent Technologies Inc. and others
-//	Portions Copyright © 2009 The Go Authors.  All rights reserved.
+//	Portions Copyright © 2009 The Go Authors. All rights reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -27,7 +27,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-package ppc64
+package mips
 
 import (
 	"cmd/internal/obj"
@@ -35,11 +35,11 @@ import (
 )
 
 func init() {
-	obj.RegisterRegister(obj.RBasePPC64, REG_DCR0+1024, Rconv)
-	obj.RegisterOpcode(obj.ABasePPC64, Anames)
+	obj.RegisterRegister(obj.RBaseMIPS, REG_LAST+1, rconv)
+	obj.RegisterOpcode(obj.ABaseMIPS, Anames)
 }
 
-func Rconv(r int) string {
+func rconv(r int) string {
 	if r == 0 {
 		return "NONE"
 	}
@@ -53,44 +53,29 @@ func Rconv(r int) string {
 	if REG_F0 <= r && r <= REG_F31 {
 		return fmt.Sprintf("F%d", r-REG_F0)
 	}
-	if REG_CR0 <= r && r <= REG_CR7 {
-		return fmt.Sprintf("CR%d", r-REG_CR0)
+	if REG_M0 <= r && r <= REG_M31 {
+		return fmt.Sprintf("M%d", r-REG_M0)
 	}
-	if r == REG_CR {
-		return "CR"
+	if REG_FCR0 <= r && r <= REG_FCR31 {
+		return fmt.Sprintf("FCR%d", r-REG_FCR0)
 	}
-	if REG_SPR0 <= r && r <= REG_SPR0+1023 {
-		switch r {
-		case REG_XER:
-			return "XER"
-
-		case REG_LR:
-			return "LR"
-
-		case REG_CTR:
-			return "CTR"
-		}
-
-		return fmt.Sprintf("SPR(%d)", r-REG_SPR0)
+	if REG_W0 <= r && r <= REG_W31 {
+		return fmt.Sprintf("W%d", r-REG_W0)
+	}
+	if r == REG_HI {
+		return "HI"
+	}
+	if r == REG_LO {
+		return "LO"
 	}
 
-	if REG_DCR0 <= r && r <= REG_DCR0+1023 {
-		return fmt.Sprintf("DCR(%d)", r-REG_DCR0)
-	}
-	if r == REG_FPSCR {
-		return "FPSCR"
-	}
-	if r == REG_MSR {
-		return "MSR"
-	}
-
-	return fmt.Sprintf("Rgok(%d)", r-obj.RBasePPC64)
+	return fmt.Sprintf("Rgok(%d)", r-obj.RBaseMIPS)
 }
 
 func DRconv(a int) string {
 	s := "C_??"
 	if a >= C_NONE && a <= C_NCLASS {
-		s = cnames9[a]
+		s = cnames0[a]
 	}
 	var fp string
 	fp += s

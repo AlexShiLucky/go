@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/internal/ascii"
 	"net/url"
 	"sort"
 	"strings"
@@ -93,6 +94,7 @@ type entry struct {
 	Value      string
 	Domain     string
 	Path       string
+	SameSite   string
 	Secure     bool
 	HttpOnly   bool
 	Persistent bool
@@ -107,7 +109,7 @@ type entry struct {
 	seqNum uint64
 }
 
-// Id returns the domain;path;name triple of e as an id.
+// id returns the domain;path;name triple of e as an id.
 func (e *entry) id() string {
 	return fmt.Sprintf("%s;%s;%s", e.Domain, e.Path, e.Name)
 }
@@ -146,24 +148,6 @@ func (e *entry) pathMatch(requestPath string) bool {
 func hasDotSuffix(s, suffix string) bool {
 	return len(s) > len(suffix) && s[len(s)-len(suffix)-1] == '.' && s[len(s)-len(suffix):] == suffix
 }
-
-// byPathLength is a []entry sort.Interface that sorts according to RFC 6265
-// section 5.4 point 2: by longest path and then by earliest creation time.
-type byPathLength []entry
-
-func (s byPathLength) Len() int { return len(s) }
-
-func (s byPathLength) Less(i, j int) bool {
-	if len(s[i].Path) != len(s[j].Path) {
-		return len(s[i].Path) > len(s[j].Path)
-	}
-	if !s[i].Creation.Equal(s[j].Creation) {
-		return s[i].Creation.Before(s[j].Creation)
-	}
-	return s[i].seqNum < s[j].seqNum
-}
-
-func (s byPathLength) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
 
 // Cookies implements the Cookies method of the http.CookieJar interface.
 //
@@ -221,7 +205,18 @@ func (j *Jar) cookies(u *url.URL, now time.Time) (cookies []*http.Cookie) {
 		}
 	}
 
-	sort.Sort(byPathLength(selected))
+	// sort according to RFC 6265 section 5.4 point 2: by longest
+	// path and then by earliest creation time.
+	sort.Slice(selected, func(i, j int) bool {
+		s := selected
+		if len(s[i].Path) != len(s[j].Path) {
+			return len(s[i].Path) > len(s[j].Path)
+		}
+		if !s[i].Creation.Equal(s[j].Creation) {
+			return s[i].Creation.Before(s[j].Creation)
+		}
+		return s[i].seqNum < s[j].seqNum
+	})
 	for _, e := range selected {
 		cookies = append(cookies, &http.Cookie{Name: e.Name, Value: e.Value})
 	}
@@ -302,7 +297,6 @@ func (j *Jar) setCookies(u *url.URL, cookies []*http.Cookie, now time.Time) {
 // host name.
 func canonicalHost(host string) (string, error) {
 	var err error
-	host = strings.ToLower(host)
 	if hasPort(host) {
 		host, _, err = net.SplitHostPort(host)
 		if err != nil {
@@ -313,7 +307,13 @@ func canonicalHost(host string) (string, error) {
 		// Strip trailing dot from fully qualified domain names.
 		host = host[:len(host)-1]
 	}
-	return toASCII(host)
+	encoded, err := toASCII(host)
+	if err != nil {
+		return "", err
+	}
+	// We know this is ascii, no need to check.
+	lower, _ := ascii.ToLower(encoded)
+	return lower, nil
 }
 
 // hasPort reports whether host contains a port number. host may be a host
@@ -338,7 +338,7 @@ func jarKey(host string, psl PublicSuffixList) string {
 	var i int
 	if psl == nil {
 		i = strings.LastIndex(host, ".")
-		if i == -1 {
+		if i <= 0 {
 			return host
 		}
 	} else {
@@ -352,6 +352,9 @@ func jarKey(host string, psl PublicSuffixList) string {
 			// Storing cookies under host is a safe stopgap.
 			return host
 		}
+		// Only len(suffix) is used to determine the jar key from
+		// here on, so it is okay if psl.PublicSuffix("www.buggy.psl")
+		// returns "com" as the jar key is generated from host.
 	}
 	prevDot := strings.LastIndex(host[:i-1], ".")
 	return host[prevDot+1:]
@@ -422,6 +425,15 @@ func (j *Jar) newEntry(c *http.Cookie, now time.Time, defPath, host string) (e e
 	e.Secure = c.Secure
 	e.HttpOnly = c.HttpOnly
 
+	switch c.SameSite {
+	case http.SameSiteDefaultMode:
+		e.SameSite = "SameSite"
+	case http.SameSiteStrictMode:
+		e.SameSite = "SameSite=Strict"
+	case http.SameSiteLaxMode:
+		e.SameSite = "SameSite=Lax"
+	}
+
 	return e, false, nil
 }
 
@@ -463,7 +475,12 @@ func (j *Jar) domainAndType(host, domain string) (string, bool, error) {
 		// both are illegal.
 		return "", false, errMalformedDomain
 	}
-	domain = strings.ToLower(domain)
+
+	domain, isASCII := ascii.ToLower(domain)
+	if !isASCII {
+		// Received non-ASCII domain, e.g. "perché.com" instead of "xn--perch-fsa.com"
+		return "", false, errMalformedDomain
+	}
 
 	if domain[len(domain)-1] == '.' {
 		// We received stuff like "Domain=www.example.com.".

@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !plan9
 // +build !plan9
 
 package net
@@ -11,16 +12,6 @@ import (
 	"syscall"
 	"testing"
 )
-
-var (
-	errTimedout       = syscall.ETIMEDOUT
-	errOpNotSupported = syscall.EOPNOTSUPP
-)
-
-func isPlatformError(err error) bool {
-	_, ok := err.(syscall.Errno)
-	return ok
-}
 
 func TestSpuriousENOTAVAIL(t *testing.T) {
 	for _, tt := range []struct {

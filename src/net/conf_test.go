@@ -2,19 +2,21 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
 // +build darwin dragonfly freebsd linux netbsd openbsd solaris
 
 package net
 
 import (
-	"os"
+	"io/fs"
 	"strings"
 	"testing"
 )
 
 type nssHostTest struct {
-	host string
-	want hostLookupOrder
+	host      string
+	localhost string
+	want      hostLookupOrder
 }
 
 func nssStr(s string) *nssConf { return parseNSSConf(strings.NewReader(s)) }
@@ -25,14 +27,14 @@ var defaultResolvConf = &dnsConfig{
 	ndots:    1,
 	timeout:  5,
 	attempts: 2,
-	err:      os.ErrNotExist,
+	err:      fs.ErrNotExist,
 }
 
 func TestConfHostLookupOrder(t *testing.T) {
 	tests := []struct {
 		name      string
 		c         *conf
-		goos      string
+		resolver  *Resolver
 		hostTests []nssHostTest
 	}{
 		{
@@ -43,8 +45,30 @@ func TestConfHostLookupOrder(t *testing.T) {
 				resolv:             defaultResolvConf,
 			},
 			hostTests: []nssHostTest{
-				{"foo.local", hostLookupCgo},
-				{"google.com", hostLookupCgo},
+				{"foo.local", "myhostname", hostLookupCgo},
+				{"google.com", "myhostname", hostLookupCgo},
+			},
+		},
+		{
+			name: "netgo_dns_before_files",
+			c: &conf{
+				netGo:  true,
+				nss:    nssStr("hosts: dns files"),
+				resolv: defaultResolvConf,
+			},
+			hostTests: []nssHostTest{
+				{"x.com", "myhostname", hostLookupDNSFiles},
+			},
+		},
+		{
+			name: "netgo_fallback_on_cgo",
+			c: &conf{
+				netGo:  true,
+				nss:    nssStr("hosts: dns files something_custom"),
+				resolv: defaultResolvConf,
+			},
+			hostTests: []nssHostTest{
+				{"x.com", "myhostname", hostLookupFilesDNS},
 			},
 		},
 		{
@@ -54,11 +78,11 @@ func TestConfHostLookupOrder(t *testing.T) {
 				resolv: defaultResolvConf,
 			},
 			hostTests: []nssHostTest{
-				{"foo.local", hostLookupCgo},
-				{"foo.local.", hostLookupCgo},
-				{"foo.LOCAL", hostLookupCgo},
-				{"foo.LOCAL.", hostLookupCgo},
-				{"google.com", hostLookupFilesDNS},
+				{"foo.local", "myhostname", hostLookupCgo},
+				{"foo.local.", "myhostname", hostLookupCgo},
+				{"foo.LOCAL", "myhostname", hostLookupCgo},
+				{"foo.LOCAL.", "myhostname", hostLookupCgo},
+				{"google.com", "myhostname", hostLookupFilesDNS},
 			},
 		},
 		{
@@ -68,7 +92,7 @@ func TestConfHostLookupOrder(t *testing.T) {
 				nss:    nssStr("foo: bar"),
 				resolv: defaultResolvConf,
 			},
-			hostTests: []nssHostTest{{"google.com", hostLookupFilesDNS}},
+			hostTests: []nssHostTest{{"google.com", "myhostname", hostLookupFilesDNS}},
 		},
 		// On OpenBSD, no resolv.conf means no DNS.
 		{
@@ -77,16 +101,16 @@ func TestConfHostLookupOrder(t *testing.T) {
 				goos:   "openbsd",
 				resolv: defaultResolvConf,
 			},
-			hostTests: []nssHostTest{{"google.com", hostLookupFiles}},
+			hostTests: []nssHostTest{{"google.com", "myhostname", hostLookupFiles}},
 		},
 		{
 			name: "solaris_no_nsswitch",
 			c: &conf{
 				goos:   "solaris",
-				nss:    &nssConf{err: os.ErrNotExist},
+				nss:    &nssConf{err: fs.ErrNotExist},
 				resolv: defaultResolvConf,
 			},
-			hostTests: []nssHostTest{{"google.com", hostLookupCgo}},
+			hostTests: []nssHostTest{{"google.com", "myhostname", hostLookupCgo}},
 		},
 		{
 			name: "openbsd_lookup_bind_file",
@@ -95,8 +119,8 @@ func TestConfHostLookupOrder(t *testing.T) {
 				resolv: &dnsConfig{lookup: []string{"bind", "file"}},
 			},
 			hostTests: []nssHostTest{
-				{"google.com", hostLookupDNSFiles},
-				{"foo.local", hostLookupDNSFiles},
+				{"google.com", "myhostname", hostLookupDNSFiles},
+				{"foo.local", "myhostname", hostLookupDNSFiles},
 			},
 		},
 		{
@@ -105,7 +129,7 @@ func TestConfHostLookupOrder(t *testing.T) {
 				goos:   "openbsd",
 				resolv: &dnsConfig{lookup: []string{"file", "bind"}},
 			},
-			hostTests: []nssHostTest{{"google.com", hostLookupFilesDNS}},
+			hostTests: []nssHostTest{{"google.com", "myhostname", hostLookupFilesDNS}},
 		},
 		{
 			name: "openbsd_lookup_bind",
@@ -113,7 +137,7 @@ func TestConfHostLookupOrder(t *testing.T) {
 				goos:   "openbsd",
 				resolv: &dnsConfig{lookup: []string{"bind"}},
 			},
-			hostTests: []nssHostTest{{"google.com", hostLookupDNS}},
+			hostTests: []nssHostTest{{"google.com", "myhostname", hostLookupDNS}},
 		},
 		{
 			name: "openbsd_lookup_file",
@@ -121,7 +145,7 @@ func TestConfHostLookupOrder(t *testing.T) {
 				goos:   "openbsd",
 				resolv: &dnsConfig{lookup: []string{"file"}},
 			},
-			hostTests: []nssHostTest{{"google.com", hostLookupFiles}},
+			hostTests: []nssHostTest{{"google.com", "myhostname", hostLookupFiles}},
 		},
 		{
 			name: "openbsd_lookup_yp",
@@ -129,7 +153,7 @@ func TestConfHostLookupOrder(t *testing.T) {
 				goos:   "openbsd",
 				resolv: &dnsConfig{lookup: []string{"file", "bind", "yp"}},
 			},
-			hostTests: []nssHostTest{{"google.com", hostLookupCgo}},
+			hostTests: []nssHostTest{{"google.com", "myhostname", hostLookupCgo}},
 		},
 		{
 			name: "openbsd_lookup_two",
@@ -137,7 +161,7 @@ func TestConfHostLookupOrder(t *testing.T) {
 				goos:   "openbsd",
 				resolv: &dnsConfig{lookup: []string{"file", "foo"}},
 			},
-			hostTests: []nssHostTest{{"google.com", hostLookupCgo}},
+			hostTests: []nssHostTest{{"google.com", "myhostname", hostLookupCgo}},
 		},
 		{
 			name: "openbsd_lookup_empty",
@@ -145,18 +169,25 @@ func TestConfHostLookupOrder(t *testing.T) {
 				goos:   "openbsd",
 				resolv: &dnsConfig{lookup: nil},
 			},
-			hostTests: []nssHostTest{{"google.com", hostLookupDNSFiles}},
+			hostTests: []nssHostTest{{"google.com", "myhostname", hostLookupDNSFiles}},
 		},
-		// glibc lacking an nsswitch.conf, per
-		// http://www.gnu.org/software/libc/manual/html_node/Notes-on-NSS-Configuration-File.html
 		{
 			name: "linux_no_nsswitch.conf",
 			c: &conf{
 				goos:   "linux",
-				nss:    &nssConf{err: os.ErrNotExist},
+				nss:    &nssConf{err: fs.ErrNotExist},
 				resolv: defaultResolvConf,
 			},
-			hostTests: []nssHostTest{{"google.com", hostLookupDNSFiles}},
+			hostTests: []nssHostTest{{"google.com", "myhostname", hostLookupFilesDNS}},
+		},
+		{
+			name: "linux_empty_nsswitch.conf",
+			c: &conf{
+				goos:   "linux",
+				nss:    nssStr(""),
+				resolv: defaultResolvConf,
+			},
+			hostTests: []nssHostTest{{"google.com", "myhostname", hostLookupFilesDNS}},
 		},
 		{
 			name: "files_mdns_dns",
@@ -165,8 +196,8 @@ func TestConfHostLookupOrder(t *testing.T) {
 				resolv: defaultResolvConf,
 			},
 			hostTests: []nssHostTest{
-				{"x.com", hostLookupFilesDNS},
-				{"x.local", hostLookupCgo},
+				{"x.com", "myhostname", hostLookupFilesDNS},
+				{"x.local", "myhostname", hostLookupCgo},
 			},
 		},
 		{
@@ -176,9 +207,9 @@ func TestConfHostLookupOrder(t *testing.T) {
 				resolv: defaultResolvConf,
 			},
 			hostTests: []nssHostTest{
-				{"x.com", hostLookupDNS},
-				{"x\\.com", hostLookupCgo},     // punt on weird glibc escape
-				{"foo.com%en0", hostLookupCgo}, // and IPv6 zones
+				{"x.com", "myhostname", hostLookupDNS},
+				{"x\\.com", "myhostname", hostLookupCgo},     // punt on weird glibc escape
+				{"foo.com%en0", "myhostname", hostLookupCgo}, // and IPv6 zones
 			},
 		},
 		{
@@ -189,8 +220,8 @@ func TestConfHostLookupOrder(t *testing.T) {
 				hasMDNSAllow: true,
 			},
 			hostTests: []nssHostTest{
-				{"x.com", hostLookupCgo},
-				{"x.local", hostLookupCgo},
+				{"x.com", "myhostname", hostLookupCgo},
+				{"x.local", "myhostname", hostLookupCgo},
 			},
 		},
 		{
@@ -200,9 +231,9 @@ func TestConfHostLookupOrder(t *testing.T) {
 				resolv: defaultResolvConf,
 			},
 			hostTests: []nssHostTest{
-				{"x.com", hostLookupFilesDNS},
-				{"x", hostLookupFilesDNS},
-				{"x.local", hostLookupCgo},
+				{"x.com", "myhostname", hostLookupFilesDNS},
+				{"x", "myhostname", hostLookupFilesDNS},
+				{"x.local", "myhostname", hostLookupCgo},
 			},
 		},
 		{
@@ -212,9 +243,9 @@ func TestConfHostLookupOrder(t *testing.T) {
 				resolv: defaultResolvConf,
 			},
 			hostTests: []nssHostTest{
-				{"x.com", hostLookupDNSFiles},
-				{"x", hostLookupDNSFiles},
-				{"x.local", hostLookupCgo},
+				{"x.com", "myhostname", hostLookupDNSFiles},
+				{"x", "myhostname", hostLookupDNSFiles},
+				{"x.local", "myhostname", hostLookupCgo},
 			},
 		},
 		{
@@ -224,7 +255,7 @@ func TestConfHostLookupOrder(t *testing.T) {
 				resolv: defaultResolvConf,
 			},
 			hostTests: []nssHostTest{
-				{"x.com", hostLookupCgo},
+				{"x.com", "myhostname", hostLookupCgo},
 			},
 		},
 		{
@@ -234,8 +265,23 @@ func TestConfHostLookupOrder(t *testing.T) {
 				resolv: defaultResolvConf,
 			},
 			hostTests: []nssHostTest{
-				{"x.com", hostLookupFilesDNS},
-				{"somehostname", hostLookupCgo},
+				{"x.com", "myhostname", hostLookupFilesDNS},
+				{"myhostname", "myhostname", hostLookupCgo},
+				{"myHostname", "myhostname", hostLookupCgo},
+				{"myhostname.dot", "myhostname.dot", hostLookupCgo},
+				{"myHostname.dot", "myhostname.dot", hostLookupCgo},
+				{"gateway", "myhostname", hostLookupCgo},
+				{"Gateway", "myhostname", hostLookupCgo},
+				{"localhost", "myhostname", hostLookupCgo},
+				{"Localhost", "myhostname", hostLookupCgo},
+				{"anything.localhost", "myhostname", hostLookupCgo},
+				{"Anything.localhost", "myhostname", hostLookupCgo},
+				{"localhost.localdomain", "myhostname", hostLookupCgo},
+				{"Localhost.Localdomain", "myhostname", hostLookupCgo},
+				{"anything.localhost.localdomain", "myhostname", hostLookupCgo},
+				{"Anything.Localhost.Localdomain", "myhostname", hostLookupCgo},
+				{"somehostname", "myhostname", hostLookupFilesDNS},
+				{"", "myhostname", hostLookupFilesDNS}, // Issue 13623
 			},
 		},
 		{
@@ -245,8 +291,9 @@ func TestConfHostLookupOrder(t *testing.T) {
 				resolv: defaultResolvConf,
 			},
 			hostTests: []nssHostTest{
-				{"x.com", hostLookupFilesDNS},
-				{"somehostname", hostLookupCgo},
+				{"x.com", "myhostname", hostLookupFilesDNS},
+				{"somehostname", "myhostname", hostLookupFilesDNS},
+				{"myhostname", "myhostname", hostLookupCgo},
 			},
 		},
 		// Debian Squeeze is just "dns,files", but lists all
@@ -260,8 +307,8 @@ func TestConfHostLookupOrder(t *testing.T) {
 				resolv: defaultResolvConf,
 			},
 			hostTests: []nssHostTest{
-				{"x.com", hostLookupDNSFiles},
-				{"somehostname", hostLookupDNSFiles},
+				{"x.com", "myhostname", hostLookupDNSFiles},
+				{"somehostname", "myhostname", hostLookupDNSFiles},
 			},
 		},
 		{
@@ -270,7 +317,7 @@ func TestConfHostLookupOrder(t *testing.T) {
 				nss:    nssStr("foo: bar"),
 				resolv: &dnsConfig{servers: defaultNS, ndots: 1, timeout: 5, attempts: 2, unknownOpt: true},
 			},
-			hostTests: []nssHostTest{{"google.com", hostLookupCgo}},
+			hostTests: []nssHostTest{{"google.com", "myhostname", hostLookupCgo}},
 		},
 		// Android should always use cgo.
 		{
@@ -281,13 +328,34 @@ func TestConfHostLookupOrder(t *testing.T) {
 				resolv: defaultResolvConf,
 			},
 			hostTests: []nssHostTest{
-				{"x.com", hostLookupCgo},
+				{"x.com", "myhostname", hostLookupCgo},
+			},
+		},
+		// Issue 24393: make sure "Resolver.PreferGo = true" acts like netgo.
+		{
+			name:     "resolver-prefergo",
+			resolver: &Resolver{PreferGo: true},
+			c: &conf{
+				goos:               "darwin",
+				forceCgoLookupHost: true, // always true for darwin
+				resolv:             defaultResolvConf,
+				nss:                nssStr(""),
+				netCgo:             true,
+			},
+			hostTests: []nssHostTest{
+				{"localhost", "myhostname", hostLookupFilesDNS},
 			},
 		},
 	}
+
+	origGetHostname := getHostname
+	defer func() { getHostname = origGetHostname }()
+
 	for _, tt := range tests {
 		for _, ht := range tt.hostTests {
-			gotOrder := tt.c.hostLookupOrder(ht.host)
+			getHostname = func() (string, error) { return ht.localhost, nil }
+
+			gotOrder := tt.c.hostLookupOrder(tt.resolver, ht.host)
 			if gotOrder != ht.want {
 				t.Errorf("%s: hostLookupOrder(%q) = %v; want %v", tt.name, ht.host, gotOrder, ht.want)
 			}

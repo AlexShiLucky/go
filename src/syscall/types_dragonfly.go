@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build ignore
 // +build ignore
 
 /*
@@ -113,6 +114,8 @@ const ( // Directory mode bits
 	S_IRUSR  = C.S_IRUSR
 	S_IWUSR  = C.S_IWUSR
 	S_IXUSR  = C.S_IXUSR
+	S_IRWXG  = C.S_IRWXG
+	S_IRWXO  = C.S_IRWXO
 )
 
 type Stat_t C.struct_stat
@@ -124,6 +127,12 @@ type Flock_t C.struct_flock
 type Dirent C.struct_dirent
 
 type Fsid C.struct_fsid
+
+// File system limits
+
+const (
+	pathMax = C.PATH_MAX
+)
 
 // Sockets
 
@@ -236,6 +245,12 @@ type BpfProgram C.struct_bpf_program
 type BpfInsn C.struct_bpf_insn
 
 type BpfHdr C.struct_bpf_hdr
+
+// Misc
+
+const (
+	_AT_FDCWD = C.AT_FDCWD
+)
 
 // Terminal handling
 

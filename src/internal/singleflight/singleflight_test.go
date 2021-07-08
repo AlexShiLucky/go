@@ -1,4 +1,4 @@
-// Copyright 2013 The Go Authors.  All rights reserved.
+// Copyright 2013 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -28,7 +28,7 @@ func TestDo(t *testing.T) {
 
 func TestDoErr(t *testing.T) {
 	var g Group
-	someErr := errors.New("Some error")
+	someErr := errors.New("some error")
 	v, err, _ := g.Do("key", func() (interface{}, error) {
 		return nil, someErr
 	})

@@ -1,4 +1,4 @@
-// Copyright 2013 The Go Authors.  All rights reserved.
+// Copyright 2013 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,7 +6,7 @@ package go1
 
 import (
 	"bytes"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -34,7 +34,7 @@ func BenchmarkHTTPClientServer(b *testing.B) {
 		if err != nil {
 			b.Fatal("Get:", err)
 		}
-		all, err := ioutil.ReadAll(res.Body)
+		all, err := io.ReadAll(res.Body)
 		if err != nil {
 			b.Fatal("ReadAll:", err)
 		}

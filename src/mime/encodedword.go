@@ -11,12 +11,11 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"sync"
 	"unicode"
 	"unicode/utf8"
 )
 
-// A WordEncoder is a RFC 2047 encoded-word encoder.
+// A WordEncoder is an RFC 2047 encoded-word encoder.
 type WordEncoder byte
 
 const (
@@ -51,38 +50,135 @@ func needsEncoding(s string) bool {
 
 // encodeWord encodes a string into an encoded-word.
 func (e WordEncoder) encodeWord(charset, s string) string {
-	buf := getBuffer()
-	defer putBuffer(buf)
+	var buf strings.Builder
+	// Could use a hint like len(s)*3, but that's not enough for cases
+	// with word splits and too much for simpler inputs.
+	// 48 is close to maxEncodedWordLen/2, but adjusted to allocator size class.
+	buf.Grow(48)
 
+	e.openWord(&buf, charset)
+	if e == BEncoding {
+		e.bEncode(&buf, charset, s)
+	} else {
+		e.qEncode(&buf, charset, s)
+	}
+	closeWord(&buf)
+
+	return buf.String()
+}
+
+const (
+	// The maximum length of an encoded-word is 75 characters.
+	// See RFC 2047, section 2.
+	maxEncodedWordLen = 75
+	// maxContentLen is how much content can be encoded, ignoring the header and
+	// 2-byte footer.
+	maxContentLen = maxEncodedWordLen - len("=?UTF-8?q?") - len("?=")
+)
+
+var maxBase64Len = base64.StdEncoding.DecodedLen(maxContentLen)
+
+// bEncode encodes s using base64 encoding and writes it to buf.
+func (e WordEncoder) bEncode(buf *strings.Builder, charset, s string) {
+	w := base64.NewEncoder(base64.StdEncoding, buf)
+	// If the charset is not UTF-8 or if the content is short, do not bother
+	// splitting the encoded-word.
+	if !isUTF8(charset) || base64.StdEncoding.EncodedLen(len(s)) <= maxContentLen {
+		io.WriteString(w, s)
+		w.Close()
+		return
+	}
+
+	var currentLen, last, runeLen int
+	for i := 0; i < len(s); i += runeLen {
+		// Multi-byte characters must not be split across encoded-words.
+		// See RFC 2047, section 5.3.
+		_, runeLen = utf8.DecodeRuneInString(s[i:])
+
+		if currentLen+runeLen <= maxBase64Len {
+			currentLen += runeLen
+		} else {
+			io.WriteString(w, s[last:i])
+			w.Close()
+			e.splitWord(buf, charset)
+			last = i
+			currentLen = runeLen
+		}
+	}
+	io.WriteString(w, s[last:])
+	w.Close()
+}
+
+// qEncode encodes s using Q encoding and writes it to buf. It splits the
+// encoded-words when necessary.
+func (e WordEncoder) qEncode(buf *strings.Builder, charset, s string) {
+	// We only split encoded-words when the charset is UTF-8.
+	if !isUTF8(charset) {
+		writeQString(buf, s)
+		return
+	}
+
+	var currentLen, runeLen int
+	for i := 0; i < len(s); i += runeLen {
+		b := s[i]
+		// Multi-byte characters must not be split across encoded-words.
+		// See RFC 2047, section 5.3.
+		var encLen int
+		if b >= ' ' && b <= '~' && b != '=' && b != '?' && b != '_' {
+			runeLen, encLen = 1, 1
+		} else {
+			_, runeLen = utf8.DecodeRuneInString(s[i:])
+			encLen = 3 * runeLen
+		}
+
+		if currentLen+encLen > maxContentLen {
+			e.splitWord(buf, charset)
+			currentLen = 0
+		}
+		writeQString(buf, s[i:i+runeLen])
+		currentLen += encLen
+	}
+}
+
+// writeQString encodes s using Q encoding and writes it to buf.
+func writeQString(buf *strings.Builder, s string) {
+	for i := 0; i < len(s); i++ {
+		switch b := s[i]; {
+		case b == ' ':
+			buf.WriteByte('_')
+		case b >= '!' && b <= '~' && b != '=' && b != '?' && b != '_':
+			buf.WriteByte(b)
+		default:
+			buf.WriteByte('=')
+			buf.WriteByte(upperhex[b>>4])
+			buf.WriteByte(upperhex[b&0x0f])
+		}
+	}
+}
+
+// openWord writes the beginning of an encoded-word into buf.
+func (e WordEncoder) openWord(buf *strings.Builder, charset string) {
 	buf.WriteString("=?")
 	buf.WriteString(charset)
 	buf.WriteByte('?')
 	buf.WriteByte(byte(e))
 	buf.WriteByte('?')
+}
 
-	if e == BEncoding {
-		w := base64.NewEncoder(base64.StdEncoding, buf)
-		io.WriteString(w, s)
-		w.Close()
-	} else {
-		enc := make([]byte, 3)
-		for i := 0; i < len(s); i++ {
-			b := s[i]
-			switch {
-			case b == ' ':
-				buf.WriteByte('_')
-			case b <= '~' && b >= '!' && b != '=' && b != '?' && b != '_':
-				buf.WriteByte(b)
-			default:
-				enc[0] = '='
-				enc[1] = upperhex[b>>4]
-				enc[2] = upperhex[b&0x0f]
-				buf.Write(enc)
-			}
-		}
-	}
+// closeWord writes the end of an encoded-word into buf.
+func closeWord(buf *strings.Builder) {
 	buf.WriteString("?=")
-	return buf.String()
+}
+
+// splitWord closes the current encoded-word and opens a new one.
+func (e WordEncoder) splitWord(buf *strings.Builder, charset string) {
+	closeWord(buf)
+	buf.WriteByte(' ')
+	e.openWord(buf, charset)
+}
+
+func isUTF8(charset string) bool {
+	return strings.EqualFold(charset, "UTF-8")
 }
 
 const upperhex = "0123456789ABCDEF"
@@ -94,26 +190,45 @@ type WordDecoder struct {
 	// charset into UTF-8.
 	// Charsets are always lower-case. utf-8, iso-8859-1 and us-ascii charsets
 	// are handled by default.
-	// One of the the CharsetReader's result values must be non-nil.
+	// One of the CharsetReader's result values must be non-nil.
 	CharsetReader func(charset string, input io.Reader) (io.Reader, error)
 }
 
 // Decode decodes an RFC 2047 encoded-word.
 func (d *WordDecoder) Decode(word string) (string, error) {
-	fields := strings.Split(word, "?") // TODO: remove allocation?
-	if len(fields) != 5 || fields[0] != "=" || fields[4] != "=" || len(fields[2]) != 1 {
+	// See https://tools.ietf.org/html/rfc2047#section-2 for details.
+	// Our decoder is permissive, we accept empty encoded-text.
+	if len(word) < 8 || !strings.HasPrefix(word, "=?") || !strings.HasSuffix(word, "?=") || strings.Count(word, "?") != 4 {
 		return "", errInvalidWord
 	}
+	word = word[2 : len(word)-2]
 
-	content, err := decode(fields[2][0], fields[3])
+	// split delimits the first 2 fields
+	split := strings.IndexByte(word, '?')
+
+	// split word "UTF-8?q?ascii" into "UTF-8", 'q', and "ascii"
+	charset := word[:split]
+	if len(charset) == 0 {
+		return "", errInvalidWord
+	}
+	if len(word) < split+3 {
+		return "", errInvalidWord
+	}
+	encoding := word[split+1]
+	// the field after split must only be one byte
+	if word[split+2] != '?' {
+		return "", errInvalidWord
+	}
+	text := word[split+3:]
+
+	content, err := decode(encoding, text)
 	if err != nil {
 		return "", err
 	}
 
-	buf := getBuffer()
-	defer putBuffer(buf)
+	var buf strings.Builder
 
-	if err := d.convert(buf, fields[1], content); err != nil {
+	if err := d.convert(&buf, charset, content); err != nil {
 		return "", err
 	}
 
@@ -129,8 +244,7 @@ func (d *WordDecoder) DecodeHeader(header string) (string, error) {
 		return header, nil
 	}
 
-	buf := getBuffer()
-	defer putBuffer(buf)
+	var buf strings.Builder
 
 	buf.WriteString(header[:i])
 	header = header[i:]
@@ -182,7 +296,7 @@ func (d *WordDecoder) DecodeHeader(header string) (string, error) {
 			buf.WriteString(header[:start])
 		}
 
-		if err := d.convert(buf, charset, content); err != nil {
+		if err := d.convert(&buf, charset, content); err != nil {
 			return "", err
 		}
 
@@ -208,7 +322,7 @@ func decode(encoding byte, text string) ([]byte, error) {
 	}
 }
 
-func (d *WordDecoder) convert(buf *bytes.Buffer, charset string, content []byte) error {
+func (d *WordDecoder) convert(buf *strings.Builder, charset string, content []byte) error {
 	switch {
 	case strings.EqualFold("utf-8", charset):
 		buf.Write(content)
@@ -232,7 +346,7 @@ func (d *WordDecoder) convert(buf *bytes.Buffer, charset string, content []byte)
 		if err != nil {
 			return err
 		}
-		if _, err = buf.ReadFrom(r); err != nil {
+		if _, err = io.Copy(buf, r); err != nil {
 			return err
 		}
 	}
@@ -307,22 +421,4 @@ func fromHex(b byte) (byte, error) {
 		return b - 'a' + 10, nil
 	}
 	return 0, fmt.Errorf("mime: invalid hex byte %#02x", b)
-}
-
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		return new(bytes.Buffer)
-	},
-}
-
-func getBuffer() *bytes.Buffer {
-	return bufPool.Get().(*bytes.Buffer)
-}
-
-func putBuffer(buf *bytes.Buffer) {
-	if buf.Len() > 1024 {
-		return
-	}
-	buf.Reset()
-	bufPool.Put(buf)
 }

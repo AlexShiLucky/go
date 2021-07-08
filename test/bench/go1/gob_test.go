@@ -1,4 +1,4 @@
-// Copyright 2011 The Go Authors.  All rights reserved.
+// Copyright 2011 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -10,7 +10,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/json"
-	"io/ioutil"
+	"io"
 	"log"
 	"reflect"
 	"testing"
@@ -73,7 +73,7 @@ func gobdec() {
 }
 
 func gobenc() {
-	if err := gob.NewEncoder(ioutil.Discard).Encode(&gobdata); err != nil {
+	if err := gob.NewEncoder(io.Discard).Encode(&gobdata); err != nil {
 		panic(err)
 	}
 }

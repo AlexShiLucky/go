@@ -1,4 +1,4 @@
-// +build !nacl
+// +build !nacl,!js,gc
 // run
 
 // Copyright 2014 The Go Authors. All rights reserved.
@@ -18,7 +18,7 @@ import (
 )
 
 func main() {
-	test(" ") // old deprecated syntax
+	// test(" ") // old deprecated & removed syntax
 	test("=") // new syntax
 }
 
@@ -36,7 +36,7 @@ func test(sep string) {
 		os.Exit(1)
 	}
 
-	want := "hello\ntrumped\n"
+	want := "hello\nhello\nhello\ntrumped\ntrumped\ntrumped\n"
 	got := out.String()
 	if got != want {
 		fmt.Printf("got %q want %q\n", got, want)
@@ -60,11 +60,11 @@ func test(sep string) {
 	}
 	outstr := string(outx)
 	if !strings.Contains(outstr, "main.b") {
-		fmt.Printf("-X linker flag did not diagnose overwrite of main.b\n")
+		fmt.Printf("-X linker flag did not diagnose overwrite of main.b:\n%s\n", outstr)
 		os.Exit(1)
 	}
 	if !strings.Contains(outstr, "main.x") {
-		fmt.Printf("-X linker flag did not diagnose overwrite of main.x\n")
+		fmt.Printf("-X linker flag did not diagnose overwrite of main.x:\n%s\n", outstr)
 		os.Exit(1)
 	}
 }

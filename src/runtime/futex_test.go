@@ -1,4 +1,4 @@
-// Copyright 2013 The Go Authors.  All rights reserved.
+// Copyright 2013 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,6 +6,7 @@
 // The race detector emits calls to split stack functions so it breaks
 // the test.
 
+//go:build (dragonfly || freebsd || linux) && !race
 // +build dragonfly freebsd linux
 // +build !race
 
@@ -13,6 +14,8 @@ package runtime_test
 
 import (
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -21,12 +24,12 @@ type futexsleepTest struct {
 	mtx uint32
 	ns  int64
 	msg string
-	ch  chan futexsleepTest
+	ch  chan *futexsleepTest
 }
 
 var futexsleepTests = []futexsleepTest{
-	beforeY2038: {mtx: 0, ns: 86400 * 1e9, msg: "before the year 2038", ch: make(chan futexsleepTest, 1)},
-	afterY2038:  {mtx: 0, ns: (1<<31 + 100) * 1e9, msg: "after the year 2038", ch: make(chan futexsleepTest, 1)},
+	beforeY2038: {mtx: 0, ns: 86400 * 1e9, msg: "before the year 2038"},
+	afterY2038:  {mtx: 0, ns: (1<<31 + 100) * 1e9, msg: "after the year 2038"},
 }
 
 const (
@@ -42,12 +45,18 @@ func TestFutexsleep(t *testing.T) {
 	}
 
 	start := time.Now()
-	for _, tt := range futexsleepTests {
-		go func(tt futexsleepTest) {
-			runtime.Entersyscall(0)
-			runtime.Futexsleep(&tt.mtx, tt.mtx, tt.ns)
-			runtime.Exitsyscall(0)
+	var wg sync.WaitGroup
+	for i := range futexsleepTests {
+		tt := &futexsleepTests[i]
+		tt.mtx = 0
+		tt.ch = make(chan *futexsleepTest, 1)
+		wg.Add(1)
+		go func(tt *futexsleepTest) {
+			runtime.Entersyscall()
+			runtime.Futexsleep(&tt.mtx, 0, tt.ns)
+			runtime.Exitsyscall()
 			tt.ch <- tt
+			wg.Done()
 		}(tt)
 	}
 loop:
@@ -71,7 +80,10 @@ loop:
 			break loop
 		}
 	}
-	for _, tt := range futexsleepTests {
+	for i := range futexsleepTests {
+		tt := &futexsleepTests[i]
+		atomic.StoreUint32(&tt.mtx, 1)
 		runtime.Futexwakeup(&tt.mtx, 1)
 	}
+	wg.Wait()
 }

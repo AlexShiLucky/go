@@ -6,6 +6,7 @@ package lex
 
 import (
 	"fmt"
+	"internal/buildcfg"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +14,8 @@ import (
 	"text/scanner"
 
 	"cmd/asm/internal/flags"
+	"cmd/internal/objabi"
+	"cmd/internal/src"
 )
 
 // Input is the main input: a stack of readers and some macro definitions.
@@ -30,7 +33,7 @@ type Input struct {
 	peekText        string
 }
 
-// NewInput returns a
+// NewInput returns an Input from the given path.
 func NewInput(name string) *Input {
 	return &Input{
 		// include directories: look in source dir, then -I directories.
@@ -43,6 +46,21 @@ func NewInput(name string) *Input {
 // predefine installs the macros set by the -D flag on the command line.
 func predefine(defines flags.MultiFlag) map[string]*Macro {
 	macros := make(map[string]*Macro)
+
+	// Set macros for GOEXPERIMENTs so we can easily switch
+	// runtime assembly code based on them.
+	if *flags.CompilingRuntime {
+		for _, exp := range buildcfg.EnabledExperiments() {
+			// Define macro.
+			name := "GOEXPERIMENT_" + exp
+			macros[name] = &Macro{
+				name:   name,
+				args:   nil,
+				tokens: Tokenize("1"),
+			}
+		}
+	}
+
 	for _, name := range defines {
 		value := "1"
 		i := strings.IndexRune(name, '=')
@@ -63,7 +81,12 @@ func predefine(defines flags.MultiFlag) map[string]*Macro {
 	return macros
 }
 
+var panicOnError bool // For testing.
+
 func (in *Input) Error(args ...interface{}) {
+	if panicOnError {
+		panic(fmt.Errorf("%s:%d: %s", in.File(), in.Line(), fmt.Sprintln(args...)))
+	}
 	fmt.Fprintf(os.Stderr, "%s:%d: %s", in.File(), in.Line(), fmt.Sprintln(args...))
 	os.Exit(1)
 }
@@ -102,6 +125,9 @@ func (in *Input) Next() ScanToken {
 				in.Error("'#' must be first item on line")
 			}
 			in.beginningOfLine = in.hash()
+			in.text = "#"
+			return '#'
+
 		case scanner.Ident:
 			// Is it a macro name?
 			name := in.Stack.Text()
@@ -113,6 +139,10 @@ func (in *Input) Next() ScanToken {
 			}
 			fallthrough
 		default:
+			if tok == scanner.EOF && len(in.ifdefStack) > 0 {
+				// We're skipping text but have run out of input with no #endif.
+				in.Error("unclosed #ifdef or #ifndef")
+			}
 			in.beginningOfLine = tok == '\n'
 			if in.enabled() {
 				in.text = in.Stack.Text()
@@ -128,7 +158,7 @@ func (in *Input) Text() string {
 	return in.text
 }
 
-// hash processes a # preprocessor directive. It returns true iff it completes.
+// hash processes a # preprocessor directive. It reports whether it completes.
 func (in *Input) hash() bool {
 	// We have a '#'; it must be followed by a known word (define, include, etc.).
 	tok := in.Stack.Next()
@@ -251,6 +281,9 @@ func (in *Input) macroDefinition(name string) ([]string, []Token) {
 	var tokens []Token
 	// Scan to newline. Backslashes escape newlines.
 	for tok != '\n' {
+		if tok == scanner.EOF {
+			in.Error("missing newline in definition for macro:", name)
+		}
 		if tok == '\\' {
 			tok = in.Stack.Next()
 			if tok != '\n' && tok != '\\' {
@@ -278,7 +311,7 @@ func lookup(args []string, arg string) int {
 func (in *Input) invokeMacro(macro *Macro) {
 	// If the macro has no arguments, just substitute the text.
 	if macro.args == nil {
-		in.Push(NewSlice(in.File(), in.Line(), macro.tokens))
+		in.Push(NewSlice(in.Base(), in.Line(), macro.tokens))
 		return
 	}
 	tok := in.Stack.Next()
@@ -288,7 +321,7 @@ func (in *Input) invokeMacro(macro *Macro) {
 		in.peekToken = tok
 		in.peekText = in.text
 		in.peek = true
-		in.Push(NewSlice(in.File(), in.Line(), []Token{Make(macroName, macro.name)}))
+		in.Push(NewSlice(in.Base(), in.Line(), []Token{Make(macroName, macro.name)}))
 		return
 	}
 	actuals := in.argsFor(macro)
@@ -305,7 +338,7 @@ func (in *Input) invokeMacro(macro *Macro) {
 		}
 		tokens = append(tokens, substitution...)
 	}
-	in.Push(NewSlice(in.File(), in.Line(), tokens))
+	in.Push(NewSlice(in.Base(), in.Line(), tokens))
 }
 
 // argsFor returns a map from formal name to actual value for this argumented macro invocation.
@@ -440,8 +473,8 @@ func (in *Input) line() {
 	if tok != '\n' {
 		in.Error("unexpected token at end of #line: ", tok)
 	}
-	linkCtxt.LineHist.Update(histLine, file, line)
-	in.Stack.SetPos(line, file)
+	pos := src.MakePos(in.Base(), uint(in.Line())+1, 1) // +1 because #line nnn means line nnn starts on next line
+	in.Stack.SetBase(src.NewLinePragmaBase(pos, file, objabi.AbsFile(objabi.WorkingDir(), file, *flags.TrimPath), uint(line), 1))
 }
 
 // #undef processing

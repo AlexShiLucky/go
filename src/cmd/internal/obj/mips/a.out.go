@@ -7,7 +7,7 @@
 //	Portions Copyright © 2004,2006 Bruce Ellis
 //	Portions Copyright © 2005-2007 C H Forsyth (forsyth@terzarima.net)
 //	Revisions Copyright © 2000-2008 Lucent Technologies Inc. and others
-//	Portions Copyright © 2009 The Go Authors.  All rights reserved.
+//	Portions Copyright © 2009 The Go Authors. All rights reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -27,24 +27,27 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-package ppc64
+package mips
 
-import "cmd/internal/obj"
+import (
+	"cmd/internal/obj"
+)
 
-//go:generate go run ../stringer.go -i $GOFILE -o anames.go -p ppc64
+//go:generate go run ../stringer.go -i $GOFILE -o anames.go -p mips
 
 /*
- * powerpc 64
+ * mips 64
  */
 const (
 	NSNAME = 8
 	NSYM   = 50
 	NREG   = 32 /* number of general registers */
 	NFREG  = 32 /* number of floating point registers */
+	NWREG  = 32 /* number of MSA registers */
 )
 
 const (
-	REG_R0 = obj.RBasePPC64 + iota
+	REG_R0 = obj.RBaseMIPS + iota // must be a multiple of 32
 	REG_R1
 	REG_R2
 	REG_R3
@@ -77,7 +80,7 @@ const (
 	REG_R30
 	REG_R31
 
-	REG_F0
+	REG_F0 // must be a multiple of 32
 	REG_F1
 	REG_F2
 	REG_F3
@@ -110,90 +113,182 @@ const (
 	REG_F30
 	REG_F31
 
-	REG_CR0
-	REG_CR1
-	REG_CR2
-	REG_CR3
-	REG_CR4
-	REG_CR5
-	REG_CR6
-	REG_CR7
+	// co-processor 0 control registers
+	REG_M0 // must be a multiple of 32
+	REG_M1
+	REG_M2
+	REG_M3
+	REG_M4
+	REG_M5
+	REG_M6
+	REG_M7
+	REG_M8
+	REG_M9
+	REG_M10
+	REG_M11
+	REG_M12
+	REG_M13
+	REG_M14
+	REG_M15
+	REG_M16
+	REG_M17
+	REG_M18
+	REG_M19
+	REG_M20
+	REG_M21
+	REG_M22
+	REG_M23
+	REG_M24
+	REG_M25
+	REG_M26
+	REG_M27
+	REG_M28
+	REG_M29
+	REG_M30
+	REG_M31
 
-	REG_MSR
-	REG_FPSCR
-	REG_CR
+	// FPU control registers
+	REG_FCR0 // must be a multiple of 32
+	REG_FCR1
+	REG_FCR2
+	REG_FCR3
+	REG_FCR4
+	REG_FCR5
+	REG_FCR6
+	REG_FCR7
+	REG_FCR8
+	REG_FCR9
+	REG_FCR10
+	REG_FCR11
+	REG_FCR12
+	REG_FCR13
+	REG_FCR14
+	REG_FCR15
+	REG_FCR16
+	REG_FCR17
+	REG_FCR18
+	REG_FCR19
+	REG_FCR20
+	REG_FCR21
+	REG_FCR22
+	REG_FCR23
+	REG_FCR24
+	REG_FCR25
+	REG_FCR26
+	REG_FCR27
+	REG_FCR28
+	REG_FCR29
+	REG_FCR30
+	REG_FCR31
 
-	REG_SPECIAL = REG_CR0
+	// MSA registers
+	// The lower bits of W registers are alias to F registers
+	REG_W0 // must be a multiple of 32
+	REG_W1
+	REG_W2
+	REG_W3
+	REG_W4
+	REG_W5
+	REG_W6
+	REG_W7
+	REG_W8
+	REG_W9
+	REG_W10
+	REG_W11
+	REG_W12
+	REG_W13
+	REG_W14
+	REG_W15
+	REG_W16
+	REG_W17
+	REG_W18
+	REG_W19
+	REG_W20
+	REG_W21
+	REG_W22
+	REG_W23
+	REG_W24
+	REG_W25
+	REG_W26
+	REG_W27
+	REG_W28
+	REG_W29
+	REG_W30
+	REG_W31
 
-	REG_SPR0 = obj.RBasePPC64 + 1024 // first of 1024 registers
-	REG_DCR0 = obj.RBasePPC64 + 2048 // first of 1024 registers
+	REG_HI
+	REG_LO
 
-	REG_XER = REG_SPR0 + 1
-	REG_LR  = REG_SPR0 + 8
-	REG_CTR = REG_SPR0 + 9
+	REG_LAST = REG_LO // the last defined register
 
-	REGZERO  = REG_R0 /* set to zero */
-	REGSP    = REG_R1
-	REGSB    = REG_R2
-	REGRET   = REG_R3
-	REGARG   = -1      /* -1 disables passing the first argument in register */
-	REGRT1   = REG_R3  /* reserved for runtime, duffzero and duffcopy */
-	REGRT2   = REG_R4  /* reserved for runtime, duffcopy */
-	REGMIN   = REG_R7  /* register variables allocated from here to REGMAX */
-	REGCTXT  = REG_R11 /* context for closures */
-	REGTLS   = REG_R13 /* C ABI TLS base pointer */
-	REGMAX   = REG_R27
-	REGEXT   = REG_R30 /* external registers allocated from here down */
-	REGG     = REG_R30 /* G */
-	REGTMP   = REG_R31 /* used by the linker */
-	FREGRET  = REG_F0
-	FREGMIN  = REG_F17 /* first register variable */
-	FREGMAX  = REG_F26 /* last register variable for 9g only */
-	FREGEXT  = REG_F26 /* first external register */
-	FREGCVI  = REG_F27 /* floating conversion constant */
-	FREGZERO = REG_F28 /* both float and double */
-	FREGHALF = REG_F29 /* double */
-	FREGONE  = REG_F30 /* double */
-	FREGTWO  = REG_F31 /* double */
+	REG_SPECIAL = REG_M0
+
+	REGZERO = REG_R0 /* set to zero */
+	REGSP   = REG_R29
+	REGSB   = REG_R28
+	REGLINK = REG_R31
+	REGRET  = REG_R1
+	REGARG  = -1      /* -1 disables passing the first argument in register */
+	REGRT1  = REG_R1  /* reserved for runtime, duffzero and duffcopy */
+	REGRT2  = REG_R2  /* reserved for runtime, duffcopy */
+	REGCTXT = REG_R22 /* context for closures */
+	REGG    = REG_R30 /* G */
+	REGTMP  = REG_R23 /* used by the linker */
+	FREGRET = REG_F0
 )
 
-/*
- * GENERAL:
- *
- * compiler allocates R3 up as temps
- * compiler allocates register variables R7-R27
- * compiler allocates external registers R30 down
- *
- * compiler allocates register variables F17-F26
- * compiler allocates external registers F26 down
- */
+// https://llvm.org/svn/llvm-project/llvm/trunk/lib/Target/Mips/MipsRegisterInfo.td search for DwarfRegNum
+// https://gcc.gnu.org/viewcvs/gcc/trunk/gcc/config/mips/mips.c?view=co&revision=258099&content-type=text%2Fplain search for mips_dwarf_regno
+// For now, this is adequate for both 32 and 64 bit.
+var MIPSDWARFRegisters = map[int16]int16{}
+
+func init() {
+	// f assigns dwarfregisters[from:to] = (base):(to-from+base)
+	f := func(from, to, base int16) {
+		for r := int16(from); r <= to; r++ {
+			MIPSDWARFRegisters[r] = (r - from) + base
+		}
+	}
+	f(REG_R0, REG_R31, 0)
+	f(REG_F0, REG_F31, 32) // For 32-bit MIPS, compiler only uses even numbered registers --  see cmd/compile/internal/ssa/gen/MIPSOps.go
+	MIPSDWARFRegisters[REG_HI] = 64
+	MIPSDWARFRegisters[REG_LO] = 65
+	// The lower bits of W registers are alias to F registers
+	f(REG_W0, REG_W31, 32)
+}
+
 const (
-	BIG = 32768 - 8
+	BIG = 32766
 )
 
 const (
 	/* mark flags */
-	LABEL   = 1 << 0
-	LEAF    = 1 << 1
-	FLOAT   = 1 << 2
-	BRANCH  = 1 << 3
-	LOAD    = 1 << 4
-	FCMP    = 1 << 5
-	SYNC    = 1 << 6
-	LIST    = 1 << 7
-	FOLL    = 1 << 8
-	NOSCHED = 1 << 9
+	FOLL    = 1 << 0
+	LABEL   = 1 << 1
+	LEAF    = 1 << 2
+	SYNC    = 1 << 3
+	BRANCH  = 1 << 4
+	LOAD    = 1 << 5
+	FCMP    = 1 << 6
+	NOSCHED = 1 << 7
+
+	NSCHED = 20
 )
 
 const (
 	C_NONE = iota
 	C_REG
 	C_FREG
-	C_CREG
-	C_SPR /* special processor register */
+	C_FCREG
+	C_MREG /* special processor register */
+	C_WREG /* MSA registers */
+	C_HI
+	C_LO
 	C_ZCON
-	C_SCON   /* 16 bit signed */
-	C_UCON   /* 32 bit signed, low 16 bits 0 */
+	C_SCON /* 16 bit signed */
+	C_UCON /* 32 bit signed, low 16 bits 0 */
+	C_ADD0CON
+	C_AND0CON
 	C_ADDCON /* -0x8000 <= v < 0 */
 	C_ANDCON /* 0 < v <= 0xFFFF */
 	C_LCON   /* other 32 */
@@ -203,6 +298,7 @@ const (
 	C_LACON /* $n(REG) where int16 < n <= int32 */
 	C_LECON
 	C_DACON /* $n(REG) where int32 < n */
+	C_STCON /* $tlsvar */
 	C_SBRA
 	C_LBRA
 	C_SAUTO
@@ -212,327 +308,176 @@ const (
 	C_ZOREG
 	C_SOREG
 	C_LOREG
-	C_FPSCR
-	C_MSR
-	C_XER
-	C_LR
-	C_CTR
-	C_ANY
 	C_GOK
 	C_ADDR
+	C_TLS
 	C_TEXTSIZE
 
 	C_NCLASS /* must be the last */
 )
 
 const (
-	AADD = obj.ABasePPC64 + obj.A_ARCHSPECIFIC + iota
-	AADDCC
-	AADDV
-	AADDVCC
-	AADDC
-	AADDCCC
-	AADDCV
-	AADDCVCC
-	AADDME
-	AADDMECC
-	AADDMEVCC
-	AADDMEV
-	AADDE
-	AADDECC
-	AADDEVCC
-	AADDEV
-	AADDZE
-	AADDZECC
-	AADDZEVCC
-	AADDZEV
+	AABSD = obj.ABaseMIPS + obj.A_ARCHSPECIFIC + iota
+	AABSF
+	AABSW
+	AADD
+	AADDD
+	AADDF
+	AADDU
+	AADDW
 	AAND
-	AANDCC
-	AANDN
-	AANDNCC
-	ABC
-	ABCL
 	ABEQ
-	ABGE
-	ABGT
-	ABLE
-	ABLT
+	ABFPF
+	ABFPT
+	ABGEZ
+	ABGEZAL
+	ABGTZ
+	ABLEZ
+	ABLTZ
+	ABLTZAL
 	ABNE
-	ABVC
-	ABVS
-	ACMP
-	ACMPU
-	ACNTLZW
-	ACNTLZWCC
-	ACRAND
-	ACRANDN
-	ACREQV
-	ACRNAND
-	ACRNOR
-	ACROR
-	ACRORN
-	ACRXOR
+	ABREAK
+	ACLO
+	ACLZ
+	ACMOVF
+	ACMOVN
+	ACMOVT
+	ACMOVZ
+	ACMPEQD
+	ACMPEQF
+	ACMPGED
+	ACMPGEF
+	ACMPGTD
+	ACMPGTF
+	ADIV
+	ADIVD
+	ADIVF
+	ADIVU
 	ADIVW
-	ADIVWCC
-	ADIVWVCC
-	ADIVWV
-	ADIVWU
-	ADIVWUCC
-	ADIVWUVCC
-	ADIVWUV
-	AEQV
-	AEQVCC
-	AEXTSB
-	AEXTSBCC
-	AEXTSH
-	AEXTSHCC
-	AFABS
-	AFABSCC
-	AFADD
-	AFADDCC
-	AFADDS
-	AFADDSCC
-	AFCMPO
-	AFCMPU
-	AFCTIW
-	AFCTIWCC
-	AFCTIWZ
-	AFCTIWZCC
-	AFDIV
-	AFDIVCC
-	AFDIVS
-	AFDIVSCC
-	AFMADD
-	AFMADDCC
-	AFMADDS
-	AFMADDSCC
-	AFMOVD
-	AFMOVDCC
-	AFMOVDU
-	AFMOVS
-	AFMOVSU
-	AFMSUB
-	AFMSUBCC
-	AFMSUBS
-	AFMSUBSCC
-	AFMUL
-	AFMULCC
-	AFMULS
-	AFMULSCC
-	AFNABS
-	AFNABSCC
-	AFNEG
-	AFNEGCC
-	AFNMADD
-	AFNMADDCC
-	AFNMADDS
-	AFNMADDSCC
-	AFNMSUB
-	AFNMSUBCC
-	AFNMSUBS
-	AFNMSUBSCC
-	AFRSP
-	AFRSPCC
-	AFSUB
-	AFSUBCC
-	AFSUBS
-	AFSUBSCC
-	AMOVMW
-	ALSW
-	ALWAR
-	AMOVWBR
+	AGOK
+	ALL
+	ALLV
+	ALUI
+	AMADD
 	AMOVB
 	AMOVBU
-	AMOVBZ
-	AMOVBZU
+	AMOVD
+	AMOVDF
+	AMOVDW
+	AMOVF
+	AMOVFD
+	AMOVFW
 	AMOVH
-	AMOVHBR
 	AMOVHU
-	AMOVHZ
-	AMOVHZU
 	AMOVW
-	AMOVWU
-	AMOVFL
-	AMOVCRFS
-	AMTFSB0
-	AMTFSB0CC
-	AMTFSB1
-	AMTFSB1CC
-	AMULHW
-	AMULHWCC
-	AMULHWU
-	AMULHWUCC
-	AMULLW
-	AMULLWCC
-	AMULLWVCC
-	AMULLWV
-	ANAND
-	ANANDCC
-	ANEG
-	ANEGCC
-	ANEGVCC
+	AMOVWD
+	AMOVWF
+	AMOVWL
+	AMOVWR
+	AMSUB
+	AMUL
+	AMULD
+	AMULF
+	AMULU
+	AMULW
+	ANEGD
+	ANEGF
+	ANEGW
 	ANEGV
+	ANOOP // hardware nop
 	ANOR
-	ANORCC
 	AOR
-	AORCC
-	AORN
-	AORNCC
 	AREM
-	AREMCC
-	AREMV
-	AREMVCC
 	AREMU
-	AREMUCC
-	AREMUV
-	AREMUVCC
-	ARFI
-	ARLWMI
-	ARLWMICC
-	ARLWNM
-	ARLWNMCC
-	ASLW
-	ASLWCC
-	ASRW
-	ASRAW
-	ASRAWCC
-	ASRWCC
-	ASTSW
-	ASTWCCC
+	ARFE
+	AROTR
+	AROTRV
+	ASC
+	ASCV
+	ASGT
+	ASGTU
+	ASLL
+	ASQRTD
+	ASQRTF
+	ASRA
+	ASRL
 	ASUB
-	ASUBCC
-	ASUBVCC
-	ASUBC
-	ASUBCCC
-	ASUBCV
-	ASUBCVCC
-	ASUBME
-	ASUBMECC
-	ASUBMEVCC
-	ASUBMEV
-	ASUBV
-	ASUBE
-	ASUBECC
-	ASUBEV
-	ASUBEVCC
-	ASUBZE
-	ASUBZECC
-	ASUBZEVCC
-	ASUBZEV
+	ASUBD
+	ASUBF
+	ASUBU
+	ASUBW
 	ASYNC
-	AXOR
-	AXORCC
-
-	ADCBF
-	ADCBI
-	ADCBST
-	ADCBT
-	ADCBTST
-	ADCBZ
-	AECIWX
-	AECOWX
-	AEIEIO
-	AICBI
-	AISYNC
-	APTESYNC
-	ATLBIE
-	ATLBIEL
-	ATLBSYNC
-	ATW
-
 	ASYSCALL
+	ATEQ
+	ATLBP
+	ATLBR
+	ATLBWI
+	ATLBWR
+	ATNE
 	AWORD
-
-	ARFCI
-
-	/* optional on 32-bit */
-	AFRES
-	AFRESCC
-	AFRSQRTE
-	AFRSQRTECC
-	AFSEL
-	AFSELCC
-	AFSQRT
-	AFSQRTCC
-	AFSQRTS
-	AFSQRTSCC
+	AXOR
 
 	/* 64-bit */
+	AMOVV
+	AMOVVL
+	AMOVVR
+	ASLLV
+	ASRAV
+	ASRLV
+	ADIVV
+	ADIVVU
+	AREMV
+	AREMVU
+	AMULV
+	AMULVU
+	AADDV
+	AADDVU
+	ASUBV
+	ASUBVU
 
-	ACNTLZD
-	ACNTLZDCC
-	ACMPW /* CMP with L=0 */
-	ACMPWU
-	ADIVD
-	ADIVDCC
-	ADIVDVCC
-	ADIVDV
-	ADIVDU
-	ADIVDUCC
-	ADIVDUVCC
-	ADIVDUV
-	AEXTSW
-	AEXTSWCC
-	/* AFCFIW; AFCFIWCC */
-	AFCFID
-	AFCFIDCC
-	AFCTID
-	AFCTIDCC
-	AFCTIDZ
-	AFCTIDZCC
-	ALDAR
-	AMOVD
-	AMOVDU
-	AMOVWZ
-	AMOVWZU
-	AMULHD
-	AMULHDCC
-	AMULHDU
-	AMULHDUCC
-	AMULLD
-	AMULLDCC
-	AMULLDVCC
-	AMULLDV
-	ARFID
-	ARLDMI
-	ARLDMICC
-	ARLDC
-	ARLDCCC
-	ARLDCR
-	ARLDCRCC
-	ARLDCL
-	ARLDCLCC
-	ASLBIA
-	ASLBIE
-	ASLBMFEE
-	ASLBMFEV
-	ASLBMTE
-	ASLD
-	ASLDCC
-	ASRD
-	ASRAD
-	ASRADCC
-	ASRDCC
-	ASTDCCC
-	ATD
+	/* 64-bit FP */
+	ATRUNCFV
+	ATRUNCDV
+	ATRUNCFW
+	ATRUNCDW
+	AMOVWU
+	AMOVFV
+	AMOVDV
+	AMOVVF
+	AMOVVD
 
-	/* 64-bit pseudo operation */
-	ADWORD
-	AREMD
-	AREMDCC
-	AREMDV
-	AREMDVCC
-	AREMDU
-	AREMDUCC
-	AREMDUV
-	AREMDUVCC
-
-	/* more 64-bit operations */
-	AHRFID
+	/* MSA */
+	AVMOVB
+	AVMOVH
+	AVMOVW
+	AVMOVD
 
 	ALAST
 
 	// aliases
-	ABR = obj.AJMP
-	ABL = obj.ACALL
+	AJMP = obj.AJMP
+	AJAL = obj.ACALL
+	ARET = obj.ARET
 )
+
+func init() {
+	// The asm encoder generally assumes that the lowest 5 bits of the
+	// REG_XX constants match the machine instruction encoding, i.e.
+	// the lowest 5 bits is the register number.
+	// Check this here.
+	if REG_R0%32 != 0 {
+		panic("REG_R0 is not a multiple of 32")
+	}
+	if REG_F0%32 != 0 {
+		panic("REG_F0 is not a multiple of 32")
+	}
+	if REG_M0%32 != 0 {
+		panic("REG_M0 is not a multiple of 32")
+	}
+	if REG_FCR0%32 != 0 {
+		panic("REG_FCR0 is not a multiple of 32")
+	}
+	if REG_W0%32 != 0 {
+		panic("REG_W0 is not a multiple of 32")
+	}
+}

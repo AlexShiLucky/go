@@ -2,8 +2,10 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build cgo,!netgo
-// +build darwin dragonfly freebsd netbsd openbsd
+//go:build cgo && !netgo && (aix || darwin || dragonfly || freebsd || netbsd || openbsd)
+// +build cgo
+// +build !netgo
+// +build aix darwin dragonfly freebsd netbsd openbsd
 
 package net
 
@@ -26,8 +28,8 @@ func cgoSockaddrInet4(ip IP) *C.struct_sockaddr {
 	return (*C.struct_sockaddr)(unsafe.Pointer(&sa))
 }
 
-func cgoSockaddrInet6(ip IP) *C.struct_sockaddr {
-	sa := syscall.RawSockaddrInet6{Len: syscall.SizeofSockaddrInet6, Family: syscall.AF_INET6}
+func cgoSockaddrInet6(ip IP, zone int) *C.struct_sockaddr {
+	sa := syscall.RawSockaddrInet6{Len: syscall.SizeofSockaddrInet6, Family: syscall.AF_INET6, Scope_id: uint32(zone)}
 	copy(sa.Addr[:], ip)
 	return (*C.struct_sockaddr)(unsafe.Pointer(&sa))
 }

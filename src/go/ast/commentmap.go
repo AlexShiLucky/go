@@ -267,7 +267,7 @@ func (cmap CommentMap) Filter(node Node) CommentMap {
 }
 
 // Comments returns the list of comment groups in the comment map.
-// The result is sorted is source order.
+// The result is sorted in source order.
 //
 func (cmap CommentMap) Comments() []*CommentGroup {
 	list := make([]*CommentGroup, 0, len(cmap))
@@ -315,9 +315,17 @@ loop:
 }
 
 func (cmap CommentMap) String() string {
+	// print map entries in sorted order
+	var nodes []Node
+	for node := range cmap {
+		nodes = append(nodes, node)
+	}
+	sort.Sort(byInterval(nodes))
+
 	var buf bytes.Buffer
 	fmt.Fprintln(&buf, "CommentMap {")
-	for node, comment := range cmap {
+	for _, node := range nodes {
+		comment := cmap[node]
 		// print name of identifiers; print node type for other nodes
 		var s string
 		if ident, ok := node.(*Ident); ok {

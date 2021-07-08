@@ -9,6 +9,7 @@ import (
 	"html/template"
 	"log"
 	"os"
+	"strings"
 )
 
 func Example() {
@@ -30,6 +31,7 @@ func Example() {
 		}
 	}
 	t, err := template.New("webpage").Parse(tpl)
+	check(err)
 
 	data := struct {
 		Title string
@@ -114,9 +116,66 @@ func Example_escape() {
 	// &#34;Fran &amp; Freddie&#39;s Diner&#34; &lt;tasty@example.com&gt;
 	// &#34;Fran &amp; Freddie&#39;s Diner&#34; &lt;tasty@example.com&gt;
 	// &#34;Fran &amp; Freddie&#39;s Diner&#34;32&lt;tasty@example.com&gt;
-	// \"Fran & Freddie\'s Diner\" \x3Ctasty@example.com\x3E
-	// \"Fran & Freddie\'s Diner\" \x3Ctasty@example.com\x3E
-	// \"Fran & Freddie\'s Diner\"32\x3Ctasty@example.com\x3E
+	// \"Fran \u0026 Freddie\'s Diner\" \u003Ctasty@example.com\u003E
+	// \"Fran \u0026 Freddie\'s Diner\" \u003Ctasty@example.com\u003E
+	// \"Fran \u0026 Freddie\'s Diner\"32\u003Ctasty@example.com\u003E
 	// %22Fran+%26+Freddie%27s+Diner%2232%3Ctasty%40example.com%3E
 
+}
+
+func ExampleTemplate_Delims() {
+	const text = "<<.Greeting>> {{.Name}}"
+
+	data := struct {
+		Greeting string
+		Name     string
+	}{
+		Greeting: "Hello",
+		Name:     "Joe",
+	}
+
+	t := template.Must(template.New("tpl").Delims("<<", ">>").Parse(text))
+
+	err := t.Execute(os.Stdout, data)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Output:
+	// Hello {{.Name}}
+}
+
+// The following example is duplicated in text/template; keep them in sync.
+
+func ExampleTemplate_block() {
+	const (
+		master  = `Names:{{block "list" .}}{{"\n"}}{{range .}}{{println "-" .}}{{end}}{{end}}`
+		overlay = `{{define "list"}} {{join . ", "}}{{end}} `
+	)
+	var (
+		funcs     = template.FuncMap{"join": strings.Join}
+		guardians = []string{"Gamora", "Groot", "Nebula", "Rocket", "Star-Lord"}
+	)
+	masterTmpl, err := template.New("master").Funcs(funcs).Parse(master)
+	if err != nil {
+		log.Fatal(err)
+	}
+	overlayTmpl, err := template.Must(masterTmpl.Clone()).Parse(overlay)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if err := masterTmpl.Execute(os.Stdout, guardians); err != nil {
+		log.Fatal(err)
+	}
+	if err := overlayTmpl.Execute(os.Stdout, guardians); err != nil {
+		log.Fatal(err)
+	}
+	// Output:
+	// Names:
+	// - Gamora
+	// - Groot
+	// - Nebula
+	// - Rocket
+	// - Star-Lord
+	// Names: Gamora, Groot, Nebula, Rocket, Star-Lord
 }

@@ -1,14 +1,23 @@
-package ppc64
+// Copyright 2015 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 
-var cnames9 = []string{
+package mips
+
+var cnames0 = []string{
 	"NONE",
 	"REG",
 	"FREG",
-	"CREG",
-	"SPR",
+	"FCREG",
+	"MREG",
+	"WREG",
+	"HI",
+	"LO",
 	"ZCON",
 	"SCON",
 	"UCON",
+	"ADD0CON",
+	"AND0CON",
 	"ADDCON",
 	"ANDCON",
 	"LCON",
@@ -18,6 +27,7 @@ var cnames9 = []string{
 	"LACON",
 	"LECON",
 	"DACON",
+	"STCON",
 	"SBRA",
 	"LBRA",
 	"SAUTO",
@@ -27,14 +37,9 @@ var cnames9 = []string{
 	"ZOREG",
 	"SOREG",
 	"LOREG",
-	"FPSCR",
-	"MSR",
-	"XER",
-	"LR",
-	"CTR",
-	"ANY",
 	"GOK",
 	"ADDR",
+	"TLS",
 	"TEXTSIZE",
 	"NCLASS",
 }

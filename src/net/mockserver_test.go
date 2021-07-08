@@ -2,23 +2,23 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !js
+// +build !js
+
 package net
 
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"sync"
 	"testing"
 	"time"
 )
 
-// testUnixAddr uses ioutil.TempFile to get a name that is unique.
-// It also uses /tmp directory in case it is prohibited to create UNIX
-// sockets in TMPDIR.
+// testUnixAddr uses os.CreateTemp to get a name that is unique.
 func testUnixAddr() string {
-	f, err := ioutil.TempFile("", "go-nettest")
+	f, err := os.CreateTemp("", "go-nettest")
 	if err != nil {
 		panic(err)
 	}
@@ -30,11 +30,21 @@ func testUnixAddr() string {
 
 func newLocalListener(network string) (Listener, error) {
 	switch network {
-	case "tcp", "tcp4", "tcp6":
-		if supportsIPv4 {
+	case "tcp":
+		if supportsIPv4() {
+			if ln, err := Listen("tcp4", "127.0.0.1:0"); err == nil {
+				return ln, nil
+			}
+		}
+		if supportsIPv6() {
+			return Listen("tcp6", "[::1]:0")
+		}
+	case "tcp4":
+		if supportsIPv4() {
 			return Listen("tcp4", "127.0.0.1:0")
 		}
-		if supportsIPv6 {
+	case "tcp6":
+		if supportsIPv6() {
 			return Listen("tcp6", "[::1]:0")
 		}
 	case "unix", "unixpacket":
@@ -78,6 +88,7 @@ type localServer struct {
 	lnmu sync.RWMutex
 	Listener
 	done chan bool // signal that indicates server stopped
+	cl   []Conn    // accepted connection list
 }
 
 func (ls *localServer) buildup(handler func(*localServer, Listener)) error {
@@ -90,10 +101,16 @@ func (ls *localServer) buildup(handler func(*localServer, Listener)) error {
 
 func (ls *localServer) teardown() error {
 	ls.lnmu.Lock()
+	defer ls.lnmu.Unlock()
 	if ls.Listener != nil {
 		network := ls.Listener.Addr().Network()
 		address := ls.Listener.Addr().String()
 		ls.Listener.Close()
+		for _, c := range ls.cl {
+			if err := c.Close(); err != nil {
+				return err
+			}
+		}
 		<-ls.done
 		ls.Listener = nil
 		switch network {
@@ -101,7 +118,6 @@ func (ls *localServer) teardown() error {
 			os.Remove(address)
 		}
 	}
-	ls.lnmu.Unlock()
 	return nil
 }
 
@@ -142,13 +158,6 @@ func (dss *dualStackServer) buildup(handler func(*dualStackServer, Listener)) er
 	return nil
 }
 
-func (dss *dualStackServer) putConn(c Conn) error {
-	dss.cmu.Lock()
-	dss.cs = append(dss.cs, c)
-	dss.cmu.Unlock()
-	return nil
-}
-
 func (dss *dualStackServer) teardownNetwork(network string) error {
 	dss.lnmu.Lock()
 	for i := range dss.lns {
@@ -181,31 +190,27 @@ func (dss *dualStackServer) teardown() error {
 	return nil
 }
 
-func newDualStackServer(lns []streamListener) (*dualStackServer, error) {
-	dss := &dualStackServer{lns: lns, port: "0"}
-	for i := range dss.lns {
-		ln, err := Listen(dss.lns[i].network, JoinHostPort(dss.lns[i].address, dss.port))
-		if err != nil {
-			for _, ln := range dss.lns[:i] {
-				ln.Listener.Close()
-			}
-			return nil, err
-		}
-		dss.lns[i].Listener = ln
-		dss.lns[i].done = make(chan bool)
-		if dss.port == "0" {
-			if _, dss.port, err = SplitHostPort(ln.Addr().String()); err != nil {
-				for _, ln := range dss.lns {
-					ln.Listener.Close()
-				}
-				return nil, err
-			}
-		}
+func newDualStackServer() (*dualStackServer, error) {
+	lns, err := newDualStackListener()
+	if err != nil {
+		return nil, err
 	}
-	return dss, nil
+	_, port, err := SplitHostPort(lns[0].Addr().String())
+	if err != nil {
+		lns[0].Close()
+		lns[1].Close()
+		return nil, err
+	}
+	return &dualStackServer{
+		lns: []streamListener{
+			{network: "tcp4", address: lns[0].Addr().String(), Listener: lns[0], done: make(chan bool)},
+			{network: "tcp6", address: lns[1].Addr().String(), Listener: lns[1], done: make(chan bool)},
+		},
+		port: port,
+	}, nil
 }
 
-func transponder(ln Listener, ch chan<- error) {
+func (ls *localServer) transponder(ln Listener, ch chan<- error) {
 	defer close(ch)
 
 	switch ln := ln.(type) {
@@ -222,10 +227,10 @@ func transponder(ln Listener, ch chan<- error) {
 		ch <- err
 		return
 	}
-	defer c.Close()
+	ls.cl = append(ls.cl, c)
 
 	network := ln.Addr().Network()
-	if c.LocalAddr().Network() != network || c.LocalAddr().Network() != network {
+	if c.LocalAddr().Network() != network || c.RemoteAddr().Network() != network {
 		ch <- fmt.Errorf("got %v->%v; expected %v->%v", c.LocalAddr().Network(), c.RemoteAddr().Network(), network, network)
 		return
 	}
@@ -333,11 +338,19 @@ func timeoutTransmitter(c Conn, d, min, max time.Duration, ch chan<- error) {
 
 func newLocalPacketListener(network string) (PacketConn, error) {
 	switch network {
-	case "udp", "udp4", "udp6":
-		if supportsIPv4 {
+	case "udp":
+		if supportsIPv4() {
 			return ListenPacket("udp4", "127.0.0.1:0")
 		}
-		if supportsIPv6 {
+		if supportsIPv6() {
+			return ListenPacket("udp6", "[::1]:0")
+		}
+	case "udp4":
+		if supportsIPv4() {
+			return ListenPacket("udp4", "127.0.0.1:0")
+		}
+	case "udp6":
+		if supportsIPv6() {
 			return ListenPacket("udp6", "[::1]:0")
 		}
 	case "unixgram":

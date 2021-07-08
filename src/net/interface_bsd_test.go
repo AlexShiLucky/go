@@ -1,18 +1,25 @@
-// Copyright 2013 The Go Authors.  All rights reserved.
+// Copyright 2013 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build darwin || dragonfly || freebsd || netbsd || openbsd
 // +build darwin dragonfly freebsd netbsd openbsd
 
 package net
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
+	"runtime"
 )
 
-func (ti *testInterface) setBroadcast(suffix int) error {
-	ti.name = fmt.Sprintf("vlan%d", suffix)
+func (ti *testInterface) setBroadcast(vid int) error {
+	if runtime.GOOS == "openbsd" {
+		ti.name = fmt.Sprintf("vether%d", vid)
+	} else {
+		ti.name = fmt.Sprintf("vlan%d", vid)
+	}
 	xname, err := exec.LookPath("ifconfig")
 	if err != nil {
 		return err
@@ -47,4 +54,8 @@ func (ti *testInterface) setPointToPoint(suffix int) error {
 		Args: []string{"ifconfig", ti.name, "destroy"},
 	})
 	return nil
+}
+
+func (ti *testInterface) setLinkLocal(suffix int) error {
+	return errors.New("not yet implemented for BSD")
 }

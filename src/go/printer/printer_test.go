@@ -10,9 +10,11 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
+	"go/internal/typeparams"
 	"go/parser"
 	"go/token"
-	"io/ioutil"
+	"io"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -32,7 +34,9 @@ type checkMode uint
 const (
 	export checkMode = 1 << iota
 	rawFormat
+	normNumber
 	idempotent
+	allowTypeParams
 )
 
 // format parses src, prints the corresponding AST, verifies the resulting
@@ -56,6 +60,9 @@ func format(src []byte, mode checkMode) ([]byte, error) {
 	if mode&rawFormat != 0 {
 		cfg.Mode |= RawFormat
 	}
+	if mode&normNumber != 0 {
+		cfg.Mode |= normalizeNumbers
+	}
 
 	// print AST
 	var buf bytes.Buffer
@@ -65,7 +72,7 @@ func format(src []byte, mode checkMode) ([]byte, error) {
 
 	// make sure formatted output is syntactically correct
 	res := buf.Bytes()
-	if _, err := parser.ParseFile(fset, "", res, 0); err != nil {
+	if _, err := parser.ParseFile(fset, "", res, parser.ParseComments); err != nil {
 		return nil, fmt.Errorf("re-parse: %s\n%s", err, buf.Bytes())
 	}
 
@@ -83,8 +90,11 @@ func lineAt(text []byte, offs int) []byte {
 
 // diff compares a and b.
 func diff(aname, bname string, a, b []byte) error {
-	var buf bytes.Buffer // holding long error message
+	if bytes.Equal(a, b) {
+		return nil
+	}
 
+	var buf bytes.Buffer // holding long error message
 	// compare lengths
 	if len(a) != len(b) {
 		fmt.Fprintf(&buf, "\nlength changed: len(%s) = %d, len(%s) = %d", aname, len(a), bname, len(b))
@@ -92,7 +102,7 @@ func diff(aname, bname string, a, b []byte) error {
 
 	// compare contents
 	line := 1
-	offs := 1
+	offs := 0
 	for i := 0; i < len(a) && i < len(b); i++ {
 		ch := a[i]
 		if ch != b[i] {
@@ -107,14 +117,12 @@ func diff(aname, bname string, a, b []byte) error {
 		}
 	}
 
-	if buf.Len() > 0 {
-		return errors.New(buf.String())
-	}
-	return nil
+	fmt.Fprintf(&buf, "\n%s:\n%s\n%s:\n%s", aname, a, bname, b)
+	return errors.New(buf.String())
 }
 
 func runcheck(t *testing.T, source, golden string, mode checkMode) {
-	src, err := ioutil.ReadFile(source)
+	src, err := os.ReadFile(source)
 	if err != nil {
 		t.Error(err)
 		return
@@ -128,14 +136,14 @@ func runcheck(t *testing.T, source, golden string, mode checkMode) {
 
 	// update golden files if necessary
 	if *update {
-		if err := ioutil.WriteFile(golden, res, 0644); err != nil {
+		if err := os.WriteFile(golden, res, 0644); err != nil {
 			t.Error(err)
 		}
 		return
 	}
 
 	// get golden
-	gld, err := ioutil.ReadFile(golden)
+	gld, err := os.ReadFile(golden)
 	if err != nil {
 		t.Error(err)
 		return
@@ -152,6 +160,10 @@ func runcheck(t *testing.T, source, golden string, mode checkMode) {
 		// (This is very difficult to achieve in general and for now
 		// it is only checked for files explicitly marked as such.)
 		res, err = format(gld, mode)
+		if err != nil {
+			t.Error(err)
+			return
+		}
 		if err := diff(golden, fmt.Sprintf("format(%s)", golden), gld, res); err != nil {
 			t.Errorf("golden is not idempotent: %s", err)
 		}
@@ -160,7 +172,7 @@ func runcheck(t *testing.T, source, golden string, mode checkMode) {
 
 func check(t *testing.T, source, golden string, mode checkMode) {
 	// run the test
-	cc := make(chan int)
+	cc := make(chan int, 1)
 	go func() {
 		runcheck(t, source, golden, mode)
 		cc <- 0
@@ -187,21 +199,41 @@ var data = []entry{
 	{"comments.input", "comments.golden", 0},
 	{"comments.input", "comments.x", export},
 	{"comments2.input", "comments2.golden", idempotent},
+	{"alignment.input", "alignment.golden", idempotent},
 	{"linebreaks.input", "linebreaks.golden", idempotent},
 	{"expressions.input", "expressions.golden", idempotent},
 	{"expressions.input", "expressions.raw", rawFormat | idempotent},
 	{"declarations.input", "declarations.golden", 0},
 	{"statements.input", "statements.golden", 0},
 	{"slow.input", "slow.golden", idempotent},
+	{"complit.input", "complit.x", export},
+	{"go2numbers.input", "go2numbers.golden", idempotent},
+	{"go2numbers.input", "go2numbers.norm", normNumber | idempotent},
+	{"generics.input", "generics.golden", idempotent | allowTypeParams},
+	{"gobuild1.input", "gobuild1.golden", idempotent},
+	{"gobuild2.input", "gobuild2.golden", idempotent},
+	{"gobuild3.input", "gobuild3.golden", idempotent},
+	{"gobuild4.input", "gobuild4.golden", idempotent},
+	{"gobuild5.input", "gobuild5.golden", idempotent},
+	{"gobuild6.input", "gobuild6.golden", idempotent},
+	{"gobuild7.input", "gobuild7.golden", idempotent},
 }
 
 func TestFiles(t *testing.T) {
+	t.Parallel()
 	for _, e := range data {
+		if !typeparams.Enabled && e.mode&allowTypeParams != 0 {
+			continue
+		}
 		source := filepath.Join(dataDir, e.source)
 		golden := filepath.Join(dataDir, e.golden)
-		check(t, source, golden, e.mode)
-		// TODO(gri) check that golden is idempotent
-		//check(t, golden, golden, e.mode)
+		mode := e.mode
+		t.Run(e.source, func(t *testing.T) {
+			t.Parallel()
+			check(t, source, golden, mode)
+			// TODO(gri) check that golden is idempotent
+			//check(t, golden, golden, e.mode)
+		})
 	}
 }
 
@@ -294,6 +326,7 @@ func testComment(t *testing.T, f *ast.File, srclen int, comment *ast.Comment) {
 // even if the position information of comments introducing newlines
 // is incorrect.
 func TestBadComments(t *testing.T) {
+	t.Parallel()
 	const src = `
 // first comment - text and position changed by test
 package p
@@ -318,7 +351,7 @@ func fibo(n int) {
 
 	comment := f.Comments[0].List[0]
 	pos := comment.Pos()
-	if fset.Position(pos).Offset != 1 {
+	if fset.PositionFor(pos, false /* absolute position */).Offset != 1 {
 		t.Error("expected offset 1") // error in test
 	}
 
@@ -356,7 +389,7 @@ func identCount(f *ast.File) int {
 	return n
 }
 
-// Verify that the SourcePos mode emits correct //line comments
+// Verify that the SourcePos mode emits correct //line directives
 // by testing that position information for matching identifiers
 // is maintained.
 func TestSourcePos(t *testing.T) {
@@ -387,7 +420,7 @@ func (t *t) foo(a, b, c int) int {
 	}
 
 	// parse pretty printed original
-	// (//line comments must be interpreted even w/o parser.ParseComments set)
+	// (//line directives must be interpreted even w/o parser.ParseComments set)
 	f2, err := parser.ParseFile(fset, "", buf.Bytes(), 0)
 	if err != nil {
 		t.Fatalf("%s\n%s", err, buf.Bytes())
@@ -415,6 +448,7 @@ func (t *t) foo(a, b, c int) int {
 			t.Errorf("got ident %s; want %s", i2.Name, i1.Name)
 		}
 
+		// here we care about the relative (line-directive adjusted) positions
 		l1 := fset.Position(i1.Pos()).Line
 		l2 := fset.Position(i2.Pos()).Line
 		if l2 != l1 {
@@ -424,6 +458,53 @@ func (t *t) foo(a, b, c int) int {
 
 	if t.Failed() {
 		t.Logf("\n%s", buf.Bytes())
+	}
+}
+
+// Verify that the SourcePos mode doesn't emit unnecessary //line directives
+// before empty lines.
+func TestIssue5945(t *testing.T) {
+	const orig = `
+package p   // line 2
+func f() {} // line 3
+
+var x, y, z int
+
+
+func g() { // line 8
+}
+`
+
+	const want = `//line src.go:2
+package p
+
+//line src.go:3
+func f() {}
+
+var x, y, z int
+
+//line src.go:8
+func g() {
+}
+`
+
+	// parse original
+	f1, err := parser.ParseFile(fset, "src.go", orig, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// pretty-print original
+	var buf bytes.Buffer
+	err = (&Config{Mode: UseSpaces | SourcePos, Tabwidth: 8}).Fprint(&buf, fset, f1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := buf.String()
+
+	// compare original with desired output
+	if got != want {
+		t.Errorf("got:\n%s\nwant:\n%s\n", got, want)
 	}
 }
 
@@ -480,11 +561,12 @@ func TestStmtLists(t *testing.T) {
 }
 
 func TestBaseIndent(t *testing.T) {
+	t.Parallel()
 	// The testfile must not contain multi-line raw strings since those
 	// are not indented (because their values must not change) and make
 	// this test fail.
 	const filename = "printer.go"
-	src, err := ioutil.ReadFile(filename)
+	src, err := os.ReadFile(filename)
 	if err != nil {
 		panic(err) // error in test
 	}
@@ -494,28 +576,31 @@ func TestBaseIndent(t *testing.T) {
 		panic(err) // error in test
 	}
 
-	var buf bytes.Buffer
 	for indent := 0; indent < 4; indent++ {
-		buf.Reset()
-		(&Config{Tabwidth: tabwidth, Indent: indent}).Fprint(&buf, fset, file)
-		// all code must be indented by at least 'indent' tabs
-		lines := bytes.Split(buf.Bytes(), []byte{'\n'})
-		for i, line := range lines {
-			if len(line) == 0 {
-				continue // empty lines don't have indentation
-			}
-			n := 0
-			for j, b := range line {
-				if b != '\t' {
-					// end of indentation
-					n = j
-					break
+		indent := indent
+		t.Run(fmt.Sprint(indent), func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			(&Config{Tabwidth: tabwidth, Indent: indent}).Fprint(&buf, fset, file)
+			// all code must be indented by at least 'indent' tabs
+			lines := bytes.Split(buf.Bytes(), []byte{'\n'})
+			for i, line := range lines {
+				if len(line) == 0 {
+					continue // empty lines don't have indentation
+				}
+				n := 0
+				for j, b := range line {
+					if b != '\t' {
+						// end of indentation
+						n = j
+						break
+					}
+				}
+				if n < indent {
+					t.Errorf("line %d: got only %d tabs; want at least %d: %q", i, n, indent, line)
 				}
 			}
-			if n < indent {
-				t.Errorf("line %d: got only %d tabs; want at least %d: %q", i, n, indent, line)
-			}
-		}
+		})
 	}
 }
 
@@ -548,6 +633,47 @@ func f()
 	}
 }
 
+type limitWriter struct {
+	remaining int
+	errCount  int
+}
+
+func (l *limitWriter) Write(buf []byte) (n int, err error) {
+	n = len(buf)
+	if n >= l.remaining {
+		n = l.remaining
+		err = io.EOF
+		l.errCount++
+	}
+	l.remaining -= n
+	return n, err
+}
+
+// Test whether the printer stops writing after the first error
+func TestWriteErrors(t *testing.T) {
+	t.Parallel()
+	const filename = "printer.go"
+	src, err := os.ReadFile(filename)
+	if err != nil {
+		panic(err) // error in test
+	}
+	file, err := parser.ParseFile(fset, filename, src, 0)
+	if err != nil {
+		panic(err) // error in test
+	}
+	for i := 0; i < 20; i++ {
+		lw := &limitWriter{remaining: i}
+		err := (&Config{Mode: RawFormat}).Fprint(lw, fset, file)
+		if lw.errCount > 1 {
+			t.Fatal("Writes continued after first error returned")
+		}
+		// We expect errCount be 1 iff err is set
+		if (lw.errCount != 0) != (err != nil) {
+			t.Fatal("Expected err when errCount != 0")
+		}
+	}
+}
+
 // TextX is a skeleton test that can be filled in for debugging one-off cases.
 // Do not remove.
 func TestX(t *testing.T) {
@@ -558,5 +684,145 @@ func _() {}
 	_, err := format([]byte(src), 0)
 	if err != nil {
 		t.Error(err)
+	}
+}
+
+func TestCommentedNode(t *testing.T) {
+	const (
+		input = `package main
+
+func foo() {
+	// comment inside func
+}
+
+// leading comment
+type bar int // comment2
+
+`
+
+		foo = `func foo() {
+	// comment inside func
+}`
+
+		bar = `// leading comment
+type bar int	// comment2
+`
+	)
+
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "input.go", input, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+
+	err = Fprint(&buf, fset, &CommentedNode{Node: f.Decls[0], Comments: f.Comments})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if buf.String() != foo {
+		t.Errorf("got %q, want %q", buf.String(), foo)
+	}
+
+	buf.Reset()
+
+	err = Fprint(&buf, fset, &CommentedNode{Node: f.Decls[1], Comments: f.Comments})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if buf.String() != bar {
+		t.Errorf("got %q, want %q", buf.String(), bar)
+	}
+}
+
+func TestIssue11151(t *testing.T) {
+	const src = "package p\t/*\r/1\r*\r/2*\r\r\r\r/3*\r\r+\r\r/4*/\n"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, parser.ParseComments)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	Fprint(&buf, fset, f)
+	got := buf.String()
+	const want = "package p\t/*/1*\r/2*\r/3*+/4*/\n" // \r following opening /* should be stripped
+	if got != want {
+		t.Errorf("\ngot : %q\nwant: %q", got, want)
+	}
+
+	// the resulting program must be valid
+	_, err = parser.ParseFile(fset, "", got, 0)
+	if err != nil {
+		t.Errorf("%v\norig: %q\ngot : %q", err, src, got)
+	}
+}
+
+// If a declaration has multiple specifications, a parenthesized
+// declaration must be printed even if Lparen is token.NoPos.
+func TestParenthesizedDecl(t *testing.T) {
+	// a package with multiple specs in a single declaration
+	const src = "package p; var ( a float64; b int )"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// print the original package
+	var buf bytes.Buffer
+	err = Fprint(&buf, fset, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := buf.String()
+
+	// now remove parentheses from the declaration
+	for i := 0; i != len(f.Decls); i++ {
+		f.Decls[i].(*ast.GenDecl).Lparen = token.NoPos
+	}
+	buf.Reset()
+	err = Fprint(&buf, fset, f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noparen := buf.String()
+
+	if noparen != original {
+		t.Errorf("got %q, want %q", noparen, original)
+	}
+}
+
+// Verify that we don't print a newline between "return" and its results, as
+// that would incorrectly cause a naked return.
+func TestIssue32854(t *testing.T) {
+	src := `package foo
+
+func f() {
+        return Composite{
+                call(),
+        }
+}`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "", src, 0)
+	if err != nil {
+		panic(err)
+	}
+
+	// Replace the result with call(), which is on the next line.
+	fd := file.Decls[0].(*ast.FuncDecl)
+	ret := fd.Body.List[0].(*ast.ReturnStmt)
+	ret.Results[0] = ret.Results[0].(*ast.CompositeLit).Elts[0]
+
+	var buf bytes.Buffer
+	if err := Fprint(&buf, fset, ret); err != nil {
+		t.Fatal(err)
+	}
+	want := "return call()"
+	if got := buf.String(); got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }

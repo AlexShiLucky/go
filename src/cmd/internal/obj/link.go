@@ -1,5 +1,5 @@
 // Derived from Inferno utils/6l/l.h and related files.
-// http://code.google.com/p/inferno-os/source/browse/utils/6l/l.h
+// https://bitbucket.org/inferno-os/inferno-os/src/master/utils/6l/l.h
 //
 //	Copyright © 1994-1999 Lucent Technologies Inc.  All rights reserved.
 //	Portions Copyright © 1995-1997 C H Forsyth (forsyth@terzarima.net)
@@ -8,7 +8,7 @@
 //	Portions Copyright © 2004,2006 Bruce Ellis
 //	Portions Copyright © 2005-2007 C H Forsyth (forsyth@terzarima.net)
 //	Revisions Copyright © 2000-2007 Lucent Technologies Inc. and others
-//	Portions Copyright © 2009 The Go Authors.  All rights reserved.
+//	Portions Copyright © 2009 The Go Authors. All rights reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -30,7 +30,17 @@
 
 package obj
 
-import "encoding/binary"
+import (
+	"bufio"
+	"cmd/internal/dwarf"
+	"cmd/internal/goobj"
+	"cmd/internal/objabi"
+	"cmd/internal/src"
+	"cmd/internal/sys"
+	"fmt"
+	"sync"
+	"sync/atomic"
+)
 
 // An Addr is an argument to an instruction.
 // The general forms and their encodings are:
@@ -109,13 +119,17 @@ import "encoding/binary"
 //			val = int32(y)
 //
 //	reg<<shift, reg>>shift, reg->shift, reg@>shift
-//		Shifted register value, for ARM.
+//		Shifted register value, for ARM and ARM64.
 //		In this form, reg must be a register and shift can be a register or an integer constant.
 //		Encoding:
 //			type = TYPE_SHIFT
+//		On ARM:
 //			offset = (reg&15) | shifttype<<5 | count
 //			shifttype = 0, 1, 2, 3 for <<, >>, ->, @>
 //			count = (reg&15)<<8 | 1<<4 for a register shift count, (n&31)<<7 for an integer constant.
+//		On ARM64:
+//			offset = (reg&31)<<16 | shifttype<<22 | (count&63)<<10
+//			shifttype = 0, 1, 2 for <<, >>, ->
 //
 //	(reg, reg)
 //		A destination register pair. When used as the last argument of an instruction,
@@ -126,10 +140,16 @@ import "encoding/binary"
 //			offset = second register
 //
 //	[reg, reg, reg-reg]
-//		Register list for ARM.
+//		Register list for ARM, ARM64, 386/AMD64.
 //		Encoding:
 //			type = TYPE_REGLIST
+//		On ARM:
 //			offset = bit mask of registers in list; R0 is low bit.
+//		On ARM64:
+//			offset = register count (Q:size) | arrangement (opcode) | first register
+//		On 386/AMD64:
+//			reg = range low register
+//			offset = 2 packed registers + kind tag (see x86.EncodeRegisterRange)
 //
 //	reg, reg
 //		Register pair for ARM.
@@ -143,18 +163,36 @@ import "encoding/binary"
 //			index = second register
 //			scale = 1
 //
+//	reg.[US]XT[BHWX]
+//		Register extension for ARM64
+//		Encoding:
+//			type = TYPE_REG
+//			reg = REG_[US]XT[BHWX] + register + shift amount
+//			offset = ((reg&31) << 16) | (exttype << 13) | (amount<<10)
+//
+//	reg.<T>
+//		Register arrangement for ARM64 SIMD register
+//		e.g.: V1.S4, V2.S2, V7.D2, V2.H4, V6.B16
+//		Encoding:
+//			type = TYPE_REG
+//			reg = REG_ARNG + register + arrangement
+//
+//	reg.<T>[index]
+//		Register element for ARM64
+//		Encoding:
+//			type = TYPE_REG
+//			reg = REG_ELEM + register + arrangement
+//			index = element index
+
 type Addr struct {
-	Type   int16
 	Reg    int16
 	Index  int16
 	Scale  int16 // Sometimes holds a register.
-	Name   int8
+	Type   AddrType
+	Name   AddrName
 	Class  int8
-	Etype  uint8
 	Offset int64
-	Width  int64
 	Sym    *LSym
-	Gotype *LSym
 
 	// argument value:
 	//	for TYPE_SCONST, a string
@@ -162,12 +200,12 @@ type Addr struct {
 	//	for TYPE_BRANCH, a *Prog (optional)
 	//	for TYPE_TEXTSIZE, an int32 (optional)
 	Val interface{}
-
-	Node interface{} // for use by compiler
 }
 
+type AddrName int8
+
 const (
-	NAME_NONE = 0 + iota
+	NAME_NONE AddrName = iota
 	NAME_EXTERN
 	NAME_STATIC
 	NAME_AUTO
@@ -175,14 +213,17 @@ const (
 	// A reference to name@GOT(SB) is a reference to the entry in the global offset
 	// table for 'name'.
 	NAME_GOTREF
+	// Indicates that this is a reference to a TOC anchor.
+	NAME_TOCREF
 )
 
-const (
-	TYPE_NONE = 0
-)
+//go:generate stringer -type AddrType
+
+type AddrType uint8
 
 const (
-	TYPE_BRANCH = 5 + iota
+	TYPE_NONE AddrType = iota
+	TYPE_BRANCH
 	TYPE_TEXTSIZE
 	TYPE_MEM
 	TYPE_CONST
@@ -197,392 +238,764 @@ const (
 	TYPE_REGLIST
 )
 
-// TODO(rsc): Describe prog.
-// TODO(rsc): Describe TEXT/GLOBL flag in from3, DATA width in from3.
-type Prog struct {
-	Ctxt   *Link
-	Link   *Prog
-	From   Addr
-	From3  *Addr // optional
-	To     Addr
-	Opt    interface{}
-	Forwd  *Prog
-	Pcond  *Prog
-	Rel    *Prog // Source of forward jumps on x86; pcrel on arm
-	Pc     int64
-	Lineno int32
-	Spadj  int32
-	As     int16
-	Reg    int16
-	RegTo2 int16 // 2nd register output operand
-	Mark   uint16
-	Optab  uint16
-	Scond  uint8
-	Back   uint8
-	Ft     uint8
-	Tt     uint8
-	Isize  uint8
-	Mode   int8
-
-	Info ProgInfo
+func (a *Addr) Target() *Prog {
+	if a.Type == TYPE_BRANCH && a.Val != nil {
+		return a.Val.(*Prog)
+	}
+	return nil
+}
+func (a *Addr) SetTarget(t *Prog) {
+	if a.Type != TYPE_BRANCH {
+		panic("setting branch target when type is not TYPE_BRANCH")
+	}
+	a.Val = t
 }
 
-// From3Type returns From3.Type, or TYPE_NONE when From3 is nil.
-func (p *Prog) From3Type() int16 {
-	if p.From3 == nil {
+func (a *Addr) SetConst(v int64) {
+	a.Sym = nil
+	a.Type = TYPE_CONST
+	a.Offset = v
+}
+
+// Prog describes a single machine instruction.
+//
+// The general instruction form is:
+//
+//	(1) As.Scond From [, ...RestArgs], To
+//	(2) As.Scond From, Reg [, ...RestArgs], To, RegTo2
+//
+// where As is an opcode and the others are arguments:
+// From, Reg are sources, and To, RegTo2 are destinations.
+// RestArgs can hold additional sources and destinations.
+// Usually, not all arguments are present.
+// For example, MOVL R1, R2 encodes using only As=MOVL, From=R1, To=R2.
+// The Scond field holds additional condition bits for systems (like arm)
+// that have generalized conditional execution.
+// (2) form is present for compatibility with older code,
+// to avoid too much changes in a single swing.
+// (1) scheme is enough to express any kind of operand combination.
+//
+// Jump instructions use the To.Val field to point to the target *Prog,
+// which must be in the same linked list as the jump instruction.
+//
+// The Progs for a given function are arranged in a list linked through the Link field.
+//
+// Each Prog is charged to a specific source line in the debug information,
+// specified by Pos.Line().
+// Every Prog has a Ctxt field that defines its context.
+// For performance reasons, Progs usually are usually bulk allocated, cached, and reused;
+// those bulk allocators should always be used, rather than new(Prog).
+//
+// The other fields not yet mentioned are for use by the back ends and should
+// be left zeroed by creators of Prog lists.
+type Prog struct {
+	Ctxt     *Link     // linker context
+	Link     *Prog     // next Prog in linked list
+	From     Addr      // first source operand
+	RestArgs []AddrPos // can pack any operands that not fit into {Prog.From, Prog.To}
+	To       Addr      // destination operand (second is RegTo2 below)
+	Pool     *Prog     // constant pool entry, for arm,arm64 back ends
+	Forwd    *Prog     // for x86 back end
+	Rel      *Prog     // for x86, arm back ends
+	Pc       int64     // for back ends or assembler: virtual or actual program counter, depending on phase
+	Pos      src.XPos  // source position of this instruction
+	Spadj    int32     // effect of instruction on stack pointer (increment or decrement amount)
+	As       As        // assembler opcode
+	Reg      int16     // 2nd source operand
+	RegTo2   int16     // 2nd destination operand
+	Mark     uint16    // bitmask of arch-specific items
+	Optab    uint16    // arch-specific opcode index
+	Scond    uint8     // bits that describe instruction suffixes (e.g. ARM conditions)
+	Back     uint8     // for x86 back end: backwards branch state
+	Ft       uint8     // for x86 back end: type index of Prog.From
+	Tt       uint8     // for x86 back end: type index of Prog.To
+	Isize    uint8     // for x86 back end: size of the instruction in bytes
+}
+
+// Pos indicates whether the oprand is the source or the destination.
+type AddrPos struct {
+	Addr
+	Pos OperandPos
+}
+
+type OperandPos int8
+
+const (
+	Source OperandPos = iota
+	Destination
+)
+
+// From3Type returns p.GetFrom3().Type, or TYPE_NONE when
+// p.GetFrom3() returns nil.
+//
+// Deprecated: for the same reasons as Prog.GetFrom3.
+func (p *Prog) From3Type() AddrType {
+	if p.RestArgs == nil {
 		return TYPE_NONE
 	}
-	return p.From3.Type
+	return p.RestArgs[0].Type
 }
 
-// From3Offset returns From3.Offset, or 0 when From3 is nil.
-func (p *Prog) From3Offset() int64 {
-	if p.From3 == nil {
-		return 0
+// GetFrom3 returns second source operand (the first is Prog.From).
+// In combination with Prog.From and Prog.To it makes common 3 operand
+// case easier to use.
+//
+// Should be used only when RestArgs is set with SetFrom3.
+//
+// Deprecated: better use RestArgs directly or define backend-specific getters.
+// Introduced to simplify transition to []Addr.
+// Usage of this is discouraged due to fragility and lack of guarantees.
+func (p *Prog) GetFrom3() *Addr {
+	if p.RestArgs == nil {
+		return nil
 	}
-	return p.From3.Offset
+	return &p.RestArgs[0].Addr
 }
 
-// ProgInfo holds information about the instruction for use
-// by clients such as the compiler. The exact meaning of this
-// data is up to the client and is not interpreted by the cmd/internal/obj/... packages.
-type ProgInfo struct {
-	Flags    uint32   // flag bits
-	Reguse   uint64   // registers implicitly used by this instruction
-	Regset   uint64   // registers implicitly set by this instruction
-	Regindex uint64   // registers used by addressing mode
-	_        struct{} // to prevent unkeyed literals
+// SetFrom3 assigns []Args{{a, 0}} to p.RestArgs.
+// In pair with Prog.GetFrom3 it can help in emulation of Prog.From3.
+//
+// Deprecated: for the same reasons as Prog.GetFrom3.
+func (p *Prog) SetFrom3(a Addr) {
+	p.RestArgs = []AddrPos{{a, Source}}
 }
 
-// Prog.as opcodes.
-// These are the portable opcodes, common to all architectures.
-// Each architecture defines many more arch-specific opcodes,
-// with values starting at A_ARCHSPECIFIC.
-// Each architecture adds an offset to this so each machine has
-// distinct space for its instructions. The offset is a power of
-// two so it can be masked to return to origin zero.
-// See the definitions of ABase386 etc.
+// SetFrom3Reg calls p.SetFrom3 with a register Addr containing reg.
+//
+// Deprecated: for the same reasons as Prog.GetFrom3.
+func (p *Prog) SetFrom3Reg(reg int16) {
+	p.SetFrom3(Addr{Type: TYPE_REG, Reg: reg})
+}
+
+// SetFrom3Const calls p.SetFrom3 with a const Addr containing x.
+//
+// Deprecated: for the same reasons as Prog.GetFrom3.
+func (p *Prog) SetFrom3Const(off int64) {
+	p.SetFrom3(Addr{Type: TYPE_CONST, Offset: off})
+}
+
+// SetTo2 assigns []Args{{a, 1}} to p.RestArgs when the second destination
+// operand does not fit into prog.RegTo2.
+func (p *Prog) SetTo2(a Addr) {
+	p.RestArgs = []AddrPos{{a, Destination}}
+}
+
+// GetTo2 returns the second destination operand.
+func (p *Prog) GetTo2() *Addr {
+	if p.RestArgs == nil {
+		return nil
+	}
+	return &p.RestArgs[0].Addr
+}
+
+// SetRestArgs assigns more than one source operands to p.RestArgs.
+func (p *Prog) SetRestArgs(args []Addr) {
+	for i := range args {
+		p.RestArgs = append(p.RestArgs, AddrPos{args[i], Source})
+	}
+}
+
+// An As denotes an assembler opcode.
+// There are some portable opcodes, declared here in package obj,
+// that are common to all architectures.
+// However, the majority of opcodes are arch-specific
+// and are declared in their respective architecture's subpackage.
+type As int16
+
+// These are the portable opcodes.
 const (
-	AXXX = 0 + iota
+	AXXX As = iota
 	ACALL
-	ACHECKNIL
-	ADATA
 	ADUFFCOPY
 	ADUFFZERO
 	AEND
 	AFUNCDATA
-	AGLOBL
 	AJMP
 	ANOP
+	APCALIGN
 	APCDATA
 	ARET
+	AGETCALLERPC
 	ATEXT
-	ATYPE
 	AUNDEF
-	AUSEFIELD
-	AVARDEF
-	AVARKILL
 	A_ARCHSPECIFIC
 )
 
+// Each architecture is allotted a distinct subspace of opcode values
+// for declaring its arch-specific opcodes.
+// Within this subspace, the first arch-specific opcode should be
+// at offset A_ARCHSPECIFIC.
+//
+// Subspaces are aligned to a power of two so opcodes can be masked
+// with AMask and used as compact array indices.
+const (
+	ABase386 = (1 + iota) << 11
+	ABaseARM
+	ABaseAMD64
+	ABasePPC64
+	ABaseARM64
+	ABaseMIPS
+	ABaseRISCV
+	ABaseS390X
+	ABaseWasm
+
+	AllowedOpCodes = 1 << 11            // The number of opcodes available for any given architecture.
+	AMask          = AllowedOpCodes - 1 // AND with this to use the opcode as an array index.
+)
+
 // An LSym is the sort of symbol that is written to an object file.
+// It represents Go symbols in a flat pkg+"."+name namespace.
 type LSym struct {
-	Name      string
-	Type      int16
-	Version   int16
-	Dupok     uint8
-	Cfunc     uint8
-	Nosplit   uint8
-	Leaf      uint8
-	Seenglobl uint8
-	Onlist    uint8
+	Name string
+	Type objabi.SymKind
+	Attribute
+
+	Size   int64
+	Gotype *LSym
+	P      []byte
+	R      []Reloc
+
+	Extra *interface{} // *FuncInfo or *FileInfo, if present
+
+	Pkg    string
+	PkgIdx int32
+	SymIdx int32
+}
+
+// A FuncInfo contains extra fields for STEXT symbols.
+type FuncInfo struct {
+	Args     int32
+	Locals   int32
+	Align    int32
+	FuncID   objabi.FuncID
+	FuncFlag objabi.FuncFlag
+	Text     *Prog
+	Autot    map[*LSym]struct{}
+	Pcln     Pcln
+	InlMarks []InlMark
+	spills   []RegSpill
+
+	dwarfInfoSym       *LSym
+	dwarfLocSym        *LSym
+	dwarfRangesSym     *LSym
+	dwarfAbsFnSym      *LSym
+	dwarfDebugLinesSym *LSym
+
+	GCArgs             *LSym
+	GCLocals           *LSym
+	StackObjects       *LSym
+	OpenCodedDeferInfo *LSym
+	ArgInfo            *LSym // argument info for traceback
+
+	FuncInfoSym *LSym
+}
+
+// NewFuncInfo allocates and returns a FuncInfo for LSym.
+func (s *LSym) NewFuncInfo() *FuncInfo {
+	if s.Extra != nil {
+		panic(fmt.Sprintf("invalid use of LSym - NewFuncInfo with Extra of type %T", *s.Extra))
+	}
+	f := new(FuncInfo)
+	s.Extra = new(interface{})
+	*s.Extra = f
+	return f
+}
+
+// Func returns the *FuncInfo associated with s, or else nil.
+func (s *LSym) Func() *FuncInfo {
+	if s.Extra == nil {
+		return nil
+	}
+	f, _ := (*s.Extra).(*FuncInfo)
+	return f
+}
+
+// A FileInfo contains extra fields for SDATA symbols backed by files.
+// (If LSym.Extra is a *FileInfo, LSym.P == nil.)
+type FileInfo struct {
+	Name string // name of file to read into object file
+	Size int64  // length of file
+}
+
+// NewFileInfo allocates and returns a FileInfo for LSym.
+func (s *LSym) NewFileInfo() *FileInfo {
+	if s.Extra != nil {
+		panic(fmt.Sprintf("invalid use of LSym - NewFileInfo with Extra of type %T", *s.Extra))
+	}
+	f := new(FileInfo)
+	s.Extra = new(interface{})
+	*s.Extra = f
+	return f
+}
+
+// File returns the *FileInfo associated with s, or else nil.
+func (s *LSym) File() *FileInfo {
+	if s.Extra == nil {
+		return nil
+	}
+	f, _ := (*s.Extra).(*FileInfo)
+	return f
+}
+
+type InlMark struct {
+	// When unwinding from an instruction in an inlined body, mark
+	// where we should unwind to.
+	// id records the global inlining id of the inlined body.
+	// p records the location of an instruction in the parent (inliner) frame.
+	p  *Prog
+	id int32
+}
+
+// Mark p as the instruction to set as the pc when
+// "unwinding" the inlining global frame id. Usually it should be
+// instruction with a file:line at the callsite, and occur
+// just before the body of the inlined function.
+func (fi *FuncInfo) AddInlMark(p *Prog, id int32) {
+	fi.InlMarks = append(fi.InlMarks, InlMark{p: p, id: id})
+}
+
+// AddSpill appends a spill record to the list for FuncInfo fi
+func (fi *FuncInfo) AddSpill(s RegSpill) {
+	fi.spills = append(fi.spills, s)
+}
+
+// Record the type symbol for an auto variable so that the linker
+// an emit DWARF type information for the type.
+func (fi *FuncInfo) RecordAutoType(gotype *LSym) {
+	if fi.Autot == nil {
+		fi.Autot = make(map[*LSym]struct{})
+	}
+	fi.Autot[gotype] = struct{}{}
+}
+
+//go:generate stringer -type ABI
+
+// ABI is the calling convention of a text symbol.
+type ABI uint8
+
+const (
+	// ABI0 is the stable stack-based ABI. It's important that the
+	// value of this is "0": we can't distinguish between
+	// references to data and ABI0 text symbols in assembly code,
+	// and hence this doesn't distinguish between symbols without
+	// an ABI and text symbols with ABI0.
+	ABI0 ABI = iota
+
+	// ABIInternal is the internal ABI that may change between Go
+	// versions. All Go functions use the internal ABI and the
+	// compiler generates wrappers for calls to and from other
+	// ABIs.
+	ABIInternal
+
+	ABICount
+)
+
+// ParseABI converts from a string representation in 'abistr' to the
+// corresponding ABI value. Second return value is TRUE if the
+// abi string is recognized, FALSE otherwise.
+func ParseABI(abistr string) (ABI, bool) {
+	switch abistr {
+	default:
+		return ABI0, false
+	case "ABI0":
+		return ABI0, true
+	case "ABIInternal":
+		return ABIInternal, true
+	}
+}
+
+// ABISet is a bit set of ABI values.
+type ABISet uint8
+
+const (
+	// ABISetCallable is the set of all ABIs any function could
+	// potentially be called using.
+	ABISetCallable ABISet = (1 << ABI0) | (1 << ABIInternal)
+)
+
+// Ensure ABISet is big enough to hold all ABIs.
+var _ ABISet = 1 << (ABICount - 1)
+
+func ABISetOf(abi ABI) ABISet {
+	return 1 << abi
+}
+
+func (a *ABISet) Set(abi ABI, value bool) {
+	if value {
+		*a |= 1 << abi
+	} else {
+		*a &^= 1 << abi
+	}
+}
+
+func (a *ABISet) Get(abi ABI) bool {
+	return (*a>>abi)&1 != 0
+}
+
+func (a ABISet) String() string {
+	s := "{"
+	for i := ABI(0); a != 0; i++ {
+		if a&(1<<i) != 0 {
+			if s != "{" {
+				s += ","
+			}
+			s += i.String()
+			a &^= 1 << i
+		}
+	}
+	return s + "}"
+}
+
+// Attribute is a set of symbol attributes.
+type Attribute uint32
+
+const (
+	AttrDuplicateOK Attribute = 1 << iota
+	AttrCFunc
+	AttrNoSplit
+	AttrLeaf
+	AttrWrapper
+	AttrNeedCtxt
+	AttrNoFrame
+	AttrOnList
+	AttrStatic
+
+	// MakeTypelink means that the type should have an entry in the typelink table.
+	AttrMakeTypelink
+
+	// ReflectMethod means the function may call reflect.Type.Method or
+	// reflect.Type.MethodByName. Matching is imprecise (as reflect.Type
+	// can be used through a custom interface), so ReflectMethod may be
+	// set in some cases when the reflect package is not called.
+	//
+	// Used by the linker to determine what methods can be pruned.
+	AttrReflectMethod
+
 	// Local means make the symbol local even when compiling Go code to reference Go
 	// symbols in other shared libraries, as in this mode symbols are global by
 	// default. "local" here means in the sense of the dynamic linker, i.e. not
 	// visible outside of the module (shared library or executable) that contains its
 	// definition. (When not compiling to support Go shared libraries, all symbols are
 	// local in this sense unless there is a cgo_export_* directive).
-	Local  bool
-	Args   int32
-	Locals int32
-	Value  int64
-	Size   int64
-	Next   *LSym
-	Gotype *LSym
-	Autom  *Auto
-	Text   *Prog
-	Etext  *Prog
-	Pcln   *Pcln
-	P      []byte
-	R      []Reloc
+	AttrLocal
+
+	// For function symbols; indicates that the specified function was the
+	// target of an inline during compilation
+	AttrWasInlined
+
+	// Indexed indicates this symbol has been assigned with an index (when using the
+	// new object file format).
+	AttrIndexed
+
+	// Only applied on type descriptor symbols, UsedInIface indicates this type is
+	// converted to an interface.
+	//
+	// Used by the linker to determine what methods can be pruned.
+	AttrUsedInIface
+
+	// ContentAddressable indicates this is a content-addressable symbol.
+	AttrContentAddressable
+
+	// ABI wrapper is set for compiler-generated text symbols that
+	// convert between ABI0 and ABIInternal calling conventions.
+	AttrABIWrapper
+
+	// attrABIBase is the value at which the ABI is encoded in
+	// Attribute. This must be last; all bits after this are
+	// assumed to be an ABI value.
+	//
+	// MUST BE LAST since all bits above this comprise the ABI.
+	attrABIBase
+)
+
+func (a *Attribute) load() Attribute { return Attribute(atomic.LoadUint32((*uint32)(a))) }
+
+func (a *Attribute) DuplicateOK() bool        { return a.load()&AttrDuplicateOK != 0 }
+func (a *Attribute) MakeTypelink() bool       { return a.load()&AttrMakeTypelink != 0 }
+func (a *Attribute) CFunc() bool              { return a.load()&AttrCFunc != 0 }
+func (a *Attribute) NoSplit() bool            { return a.load()&AttrNoSplit != 0 }
+func (a *Attribute) Leaf() bool               { return a.load()&AttrLeaf != 0 }
+func (a *Attribute) OnList() bool             { return a.load()&AttrOnList != 0 }
+func (a *Attribute) ReflectMethod() bool      { return a.load()&AttrReflectMethod != 0 }
+func (a *Attribute) Local() bool              { return a.load()&AttrLocal != 0 }
+func (a *Attribute) Wrapper() bool            { return a.load()&AttrWrapper != 0 }
+func (a *Attribute) NeedCtxt() bool           { return a.load()&AttrNeedCtxt != 0 }
+func (a *Attribute) NoFrame() bool            { return a.load()&AttrNoFrame != 0 }
+func (a *Attribute) Static() bool             { return a.load()&AttrStatic != 0 }
+func (a *Attribute) WasInlined() bool         { return a.load()&AttrWasInlined != 0 }
+func (a *Attribute) Indexed() bool            { return a.load()&AttrIndexed != 0 }
+func (a *Attribute) UsedInIface() bool        { return a.load()&AttrUsedInIface != 0 }
+func (a *Attribute) ContentAddressable() bool { return a.load()&AttrContentAddressable != 0 }
+func (a *Attribute) ABIWrapper() bool         { return a.load()&AttrABIWrapper != 0 }
+
+func (a *Attribute) Set(flag Attribute, value bool) {
+	for {
+		v0 := a.load()
+		v := v0
+		if value {
+			v |= flag
+		} else {
+			v &^= flag
+		}
+		if atomic.CompareAndSwapUint32((*uint32)(a), uint32(v0), uint32(v)) {
+			break
+		}
+	}
 }
+
+func (a *Attribute) ABI() ABI { return ABI(a.load() / attrABIBase) }
+func (a *Attribute) SetABI(abi ABI) {
+	const mask = 1 // Only one ABI bit for now.
+	for {
+		v0 := a.load()
+		v := (v0 &^ (mask * attrABIBase)) | Attribute(abi)*attrABIBase
+		if atomic.CompareAndSwapUint32((*uint32)(a), uint32(v0), uint32(v)) {
+			break
+		}
+	}
+}
+
+var textAttrStrings = [...]struct {
+	bit Attribute
+	s   string
+}{
+	{bit: AttrDuplicateOK, s: "DUPOK"},
+	{bit: AttrMakeTypelink, s: ""},
+	{bit: AttrCFunc, s: "CFUNC"},
+	{bit: AttrNoSplit, s: "NOSPLIT"},
+	{bit: AttrLeaf, s: "LEAF"},
+	{bit: AttrOnList, s: ""},
+	{bit: AttrReflectMethod, s: "REFLECTMETHOD"},
+	{bit: AttrLocal, s: "LOCAL"},
+	{bit: AttrWrapper, s: "WRAPPER"},
+	{bit: AttrNeedCtxt, s: "NEEDCTXT"},
+	{bit: AttrNoFrame, s: "NOFRAME"},
+	{bit: AttrStatic, s: "STATIC"},
+	{bit: AttrWasInlined, s: ""},
+	{bit: AttrIndexed, s: ""},
+	{bit: AttrContentAddressable, s: ""},
+	{bit: AttrABIWrapper, s: "ABIWRAPPER"},
+}
+
+// String formats a for printing in as part of a TEXT prog.
+func (a Attribute) String() string {
+	var s string
+	for _, x := range textAttrStrings {
+		if a&x.bit != 0 {
+			if x.s != "" {
+				s += x.s + "|"
+			}
+			a &^= x.bit
+		}
+	}
+	switch a.ABI() {
+	case ABI0:
+	case ABIInternal:
+		s += "ABIInternal|"
+		a.SetABI(0) // Clear ABI so we don't print below.
+	}
+	if a != 0 {
+		s += fmt.Sprintf("UnknownAttribute(%d)|", a)
+	}
+	// Chop off trailing |, if present.
+	if len(s) > 0 {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// TextAttrString formats the symbol attributes for printing in as part of a TEXT prog.
+func (s *LSym) TextAttrString() string {
+	attr := s.Attribute.String()
+	if s.Func().FuncFlag&objabi.FuncFlag_TOPFRAME != 0 {
+		if attr != "" {
+			attr += "|"
+		}
+		attr += "TOPFRAME"
+	}
+	return attr
+}
+
+func (s *LSym) String() string {
+	return s.Name
+}
+
+// The compiler needs *LSym to be assignable to cmd/compile/internal/ssa.Sym.
+func (*LSym) CanBeAnSSASym() {}
+func (*LSym) CanBeAnSSAAux() {}
 
 type Pcln struct {
-	Pcsp        Pcdata
-	Pcfile      Pcdata
-	Pcline      Pcdata
-	Pcdata      []Pcdata
+	// Aux symbols for pcln
+	Pcsp        *LSym
+	Pcfile      *LSym
+	Pcline      *LSym
+	Pcinline    *LSym
+	Pcdata      []*LSym
 	Funcdata    []*LSym
 	Funcdataoff []int64
-	File        []*LSym
-	Lastfile    *LSym
-	Lastindex   int
+	UsedFiles   map[goobj.CUFileIndex]struct{} // file indices used while generating pcfile
+	InlTree     InlTree                        // per-function inlining tree extracted from the global tree
 }
-
-// LSym.type
-const (
-	Sxxx = iota
-	STEXT
-	SELFRXSECT
-
-	STYPE
-	SSTRING
-	SGOSTRING
-	SGOFUNC
-	SGCBITS
-	SRODATA
-	SFUNCTAB
-
-	// Types STYPE-SFUNCTAB above are written to the .rodata section by default.
-	// When linking a shared object, some conceptually "read only" types need to
-	// be written to by relocations and putting them in a section called
-	// ".rodata" interacts poorly with the system linkers. The GNU linkers
-	// support this situation by arranging for sections of the name
-	// ".data.rel.ro.XXX" to be mprotected read only by the dynamic linker after
-	// relocations have applied, so when the Go linker is creating a shared
-	// object it checks all objects of the above types and bumps any object that
-	// has a relocation to it to the corresponding type below, which are then
-	// written to sections with appropriate magic names.
-	STYPERELRO
-	SSTRINGRELRO
-	SGOSTRINGRELRO
-	SGOFUNCRELRO
-	SGCBITSRELRO
-	SRODATARELRO
-	SFUNCTABRELRO
-
-	STYPELINK
-	SSYMTAB
-	SPCLNTAB
-	SELFROSECT
-	SMACHOPLT
-	SELFSECT
-	SMACHO
-	SMACHOGOT
-	SWINDOWS
-	SELFGOT
-	SNOPTRDATA
-	SINITARR
-	SDATA
-	SBSS
-	SNOPTRBSS
-	STLSBSS
-	SXREF
-	SMACHOSYMSTR
-	SMACHOSYMTAB
-	SMACHOINDIRECTPLT
-	SMACHOINDIRECTGOT
-	SFILE
-	SFILEPATH
-	SCONST
-	SDYNIMPORT
-	SHOSTOBJ
-	SSUB       = 1 << 8
-	SMASK      = SSUB - 1
-	SHIDDEN    = 1 << 9
-	SCONTAINER = 1 << 10 // has a sub-symbol
-)
 
 type Reloc struct {
 	Off  int32
 	Siz  uint8
-	Type int32
+	Type objabi.RelocType
 	Add  int64
 	Sym  *LSym
 }
 
-// Reloc.type
-const (
-	R_ADDR = 1 + iota
-	R_ADDRPOWER
-	R_ADDRARM64
-	R_SIZE
-	R_CALL
-	R_CALLARM
-	R_CALLARM64
-	R_CALLIND
-	R_CALLPOWER
-	R_CONST
-	R_PCREL
-	// R_TLS (only used on arm currently, and not on android and darwin where tlsg is
-	// a regular variable) resolves to data needed to access the thread-local g. It is
-	// interpreted differently depending on toolchain flags to implement either the
-	// "local exec" or "inital exec" model for tls access.
-	// TODO(mwhudson): change to use R_TLS_LE or R_TLS_IE as appropriate, not having
-	// R_TLS do double duty.
-	R_TLS
-	// R_TLS_LE (only used on 386 and amd64 currently) resolves to the offset of the
-	// thread-local g from the thread local base and is used to implement the "local
-	// exec" model for tls access (r.Sym is not set by the compiler for this case but
-	// is set to Tlsg in the linker when externally linking).
-	R_TLS_LE
-	// R_TLS_IE (only used on 386 and amd64 currently) resolves to the PC-relative
-	// offset to a GOT slot containing the offset the thread-local g from the thread
-	// local base and is used to implemented the "initial exec" model for tls access
-	// (r.Sym is not set by the compiler for this case but is set to Tlsg in the
-	// linker when externally linking).
-	R_TLS_IE
-	R_GOTOFF
-	R_PLT0
-	R_PLT1
-	R_PLT2
-	R_USEFIELD
-	R_POWER_TOC
-	R_GOTPCREL
-)
-
 type Auto struct {
 	Asym    *LSym
-	Link    *Auto
 	Aoffset int32
-	Name    int16
+	Name    AddrName
 	Gotype  *LSym
 }
 
-// Auto.name
-const (
-	A_AUTO = 1 + iota
-	A_PARAM
-)
-
-type Pcdata struct {
-	P []byte
+// RegSpill provides spill/fill information for a register-resident argument
+// to a function.  These need spilling/filling in the safepoint/stackgrowth case.
+// At the time of fill/spill, the offset must be adjusted by the architecture-dependent
+// adjustment to hardware SP that occurs in a call instruction.  E.g., for AMD64,
+// at Offset+8 because the return address was pushed.
+type RegSpill struct {
+	Addr           Addr
+	Reg            int16
+	Spill, Unspill As
 }
-
-// Pcdata iterator.
-//      for(pciterinit(ctxt, &it, &pcd); !it.done; pciternext(&it)) { it.value holds in [it.pc, it.nextpc) }
-type Pciter struct {
-	d       Pcdata
-	p       []byte
-	pc      uint32
-	nextpc  uint32
-	pcscale uint32
-	value   int32
-	start   int
-	done    int
-}
-
-// symbol version, incremented each time a file is loaded.
-// version==1 is reserved for savehist.
-const (
-	HistVersion = 1
-)
 
 // Link holds the context for writing object code from a compiler
 // to be linker input or for reading that input into the linker.
 type Link struct {
-	Goarm              int32
-	Headtype           int
+	Headtype           objabi.HeadType
 	Arch               *LinkArch
-	Debugasm           int32
-	Debugvlog          int32
-	Debugdivmod        int32
-	Debugpcln          int32
-	Flag_shared        int32
+	Debugasm           int
+	Debugvlog          bool
+	Debugpcln          string
+	Flag_shared        bool
 	Flag_dynlink       bool
-	Bso                *Biobuf
+	Flag_linkshared    bool
+	Flag_optimize      bool
+	Flag_locationlists bool
+	Retpoline          bool // emit use of retpoline stubs for indirect jmp/call
+	Bso                *bufio.Writer
 	Pathname           string
-	Windows            int32
-	Goroot             string
-	Goroot_final       string
-	Enforce_data_order int32
-	Hash               map[SymVer]*LSym
-	LineHist           LineHist
-	Imports            []string
-	Plist              *Plist
-	Plast              *Plist
-	Sym_div            *LSym
-	Sym_divu           *LSym
-	Sym_mod            *LSym
-	Sym_modu           *LSym
-	Tlsg               *LSym
-	Plan9privates      *LSym
-	Curp               *Prog
-	Printp             *Prog
-	Blitrl             *Prog
-	Elitrl             *Prog
-	Rexflag            int
-	Rep                int
-	Repn               int
-	Lock               int
-	Asmode             int
-	Andptr             []byte
-	And                [100]uint8
-	Instoffset         int64
-	Autosize           int32
-	Armsize            int32
-	Pc                 int64
-	Diag               func(string, ...interface{})
-	Mode               int
-	Cursym             *LSym
-	Version            int
-	Textp              *LSym
-	Etextp             *LSym
+	Pkgpath            string           // the current package's import path, "" if unknown
+	hashmu             sync.Mutex       // protects hash, funchash
+	hash               map[string]*LSym // name -> sym mapping
+	funchash           map[string]*LSym // name -> sym mapping for ABIInternal syms
+	statichash         map[string]*LSym // name -> sym mapping for static syms
+	PosTable           src.PosTable
+	InlTree            InlTree // global inlining tree used by gc/inl.go
+	DwFixups           *DwarfFixupTable
+	Imports            []goobj.ImportedPkg
+	DiagFunc           func(string, ...interface{})
+	DiagFlush          func()
+	DebugInfo          func(fn *LSym, info *LSym, curfn interface{}) ([]dwarf.Scope, dwarf.InlCalls) // if non-nil, curfn is a *gc.Node
+	GenAbstractFunc    func(fn *LSym)
+	Errors             int
+
+	InParallel    bool // parallel backend phase in effect
+	UseBASEntries bool // use Base Address Selection Entries in location lists and PC ranges
+	IsAsm         bool // is the source assembly language, which may contain surprising idioms (e.g., call tables)
+
+	// state for writing objects
+	Text []*LSym
+	Data []*LSym
+
+	// ABIAliases are text symbols that should be aliased to all
+	// ABIs. These symbols may only be referenced and not defined
+	// by this object, since the need for an alias may appear in a
+	// different object than the definition. Hence, this
+	// information can't be carried in the symbol definition.
+	//
+	// TODO(austin): Replace this with ABI wrappers once the ABIs
+	// actually diverge.
+	ABIAliases []*LSym
+
+	// Constant symbols (e.g. $i64.*) are data symbols created late
+	// in the concurrent phase. To ensure a deterministic order, we
+	// add them to a separate list, sort at the end, and append it
+	// to Data.
+	constSyms []*LSym
+
+	// pkgIdx maps package path to index. The index is used for
+	// symbol reference in the object file.
+	pkgIdx map[string]int32
+
+	defs         []*LSym // list of defined symbols in the current package
+	hashed64defs []*LSym // list of defined short (64-bit or less) hashed (content-addressable) symbols
+	hasheddefs   []*LSym // list of defined hashed (content-addressable) symbols
+	nonpkgdefs   []*LSym // list of defined non-package symbols
+	nonpkgrefs   []*LSym // list of referenced non-package symbols
+
+	Fingerprint goobj.FingerprintType // fingerprint of symbol indices, to catch index mismatch
 }
 
-type SymVer struct {
-	Name    string
-	Version int // TODO: make int16 to match LSym.Version?
+func (ctxt *Link) Diag(format string, args ...interface{}) {
+	ctxt.Errors++
+	ctxt.DiagFunc(format, args...)
+}
+
+func (ctxt *Link) Logf(format string, args ...interface{}) {
+	fmt.Fprintf(ctxt.Bso, format, args...)
+	ctxt.Bso.Flush()
+}
+
+// SpillRegisterArgs emits the code to spill register args into whatever
+// locations the spill records specify.
+func (fi *FuncInfo) SpillRegisterArgs(last *Prog, pa ProgAlloc) *Prog {
+	// Spill register args.
+	for _, ra := range fi.spills {
+		spill := Appendp(last, pa)
+		spill.As = ra.Spill
+		spill.From.Type = TYPE_REG
+		spill.From.Reg = ra.Reg
+		spill.To = ra.Addr
+		last = spill
+	}
+	return last
+}
+
+// UnspillRegisterArgs emits the code to restore register args from whatever
+// locations the spill records specify.
+func (fi *FuncInfo) UnspillRegisterArgs(last *Prog, pa ProgAlloc) *Prog {
+	// Unspill any spilled register args
+	for _, ra := range fi.spills {
+		unspill := Appendp(last, pa)
+		unspill.As = ra.Unspill
+		unspill.From = ra.Addr
+		unspill.To.Type = TYPE_REG
+		unspill.To.Reg = ra.Reg
+		last = unspill
+	}
+	return last
+}
+
+// The smallest possible offset from the hardware stack pointer to a local
+// variable on the stack. Architectures that use a link register save its value
+// on the stack in the function prologue and so always have a pointer between
+// the hardware stack pointer and the local variable area.
+func (ctxt *Link) FixedFrameSize() int64 {
+	switch ctxt.Arch.Family {
+	case sys.AMD64, sys.I386, sys.Wasm:
+		return 0
+	case sys.PPC64:
+		// PIC code on ppc64le requires 32 bytes of stack, and it's easier to
+		// just use that much stack always on ppc64x.
+		return int64(4 * ctxt.Arch.PtrSize)
+	default:
+		return int64(ctxt.Arch.PtrSize)
+	}
 }
 
 // LinkArch is the definition of a single architecture.
 type LinkArch struct {
-	ByteOrder  binary.ByteOrder
-	Name       string
-	Thechar    int
-	Preprocess func(*Link, *LSym)
-	Assemble   func(*Link, *LSym)
-	Follow     func(*Link, *LSym)
-	Progedit   func(*Link, *Prog)
-	UnaryDst   map[int]bool // Instruction takes one operand, a destination.
-	Minlc      int
-	Ptrsize    int
-	Regsize    int
-}
-
-/* executable header types */
-const (
-	Hunknown = 0 + iota
-	Hdarwin
-	Hdragonfly
-	Helf
-	Hfreebsd
-	Hlinux
-	Hnacl
-	Hnetbsd
-	Hopenbsd
-	Hplan9
-	Hsolaris
-	Hwindows
-)
-
-type Plist struct {
-	Name    *LSym
-	Firstpc *Prog
-	Recur   int
-	Link    *Plist
-}
-
-/*
- * start a new Prog list.
- */
-func Linknewplist(ctxt *Link) *Plist {
-	pl := new(Plist)
-	if ctxt.Plist == nil {
-		ctxt.Plist = pl
-	} else {
-		ctxt.Plast.Link = pl
-	}
-	ctxt.Plast = pl
-	return pl
+	*sys.Arch
+	Init           func(*Link)
+	ErrorCheck     func(*Link, *LSym)
+	Preprocess     func(*Link, *LSym, ProgAlloc)
+	Assemble       func(*Link, *LSym, ProgAlloc)
+	Progedit       func(*Link, *Prog, ProgAlloc)
+	UnaryDst       map[As]bool // Instruction takes one operand, a destination.
+	DWARFRegisters map[int16]int16
 }

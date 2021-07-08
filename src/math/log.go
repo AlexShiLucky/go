@@ -10,7 +10,7 @@ package math
 
 // The original C code, the long comment, and the constants
 // below are from FreeBSD's /usr/src/lib/msun/src/e_log.c
-// and came with this notice.  The go code is a simpler
+// and came with this notice. The go code is a simpler
 // version of the original C.
 //
 // ====================================================
@@ -77,7 +77,12 @@ package math
 //	Log(0) = -Inf
 //	Log(x < 0) = NaN
 //	Log(NaN) = NaN
-func Log(x float64) float64
+func Log(x float64) float64 {
+	if haveArchLog {
+		return archLog(x)
+	}
+	return log(x)
+}
 
 func log(x float64) float64 {
 	const (

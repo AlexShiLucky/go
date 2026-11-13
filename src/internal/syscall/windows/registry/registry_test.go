@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build windows
+//go:build windows
 
 package registry_test
 
@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"os"
+	"slices"
 	"syscall"
 	"testing"
 	"unsafe"
@@ -28,13 +29,13 @@ func randKeyName(prefix string) string {
 }
 
 func TestReadSubKeyNames(t *testing.T) {
-	k, err := registry.OpenKey(registry.CLASSES_ROOT, "TypeLib", registry.ENUMERATE_SUB_KEYS|registry.QUERY_VALUE)
+	k, err := registry.OpenKey(registry.CLASSES_ROOT, "TypeLib", registry.ENUMERATE_SUB_KEYS)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer k.Close()
 
-	names, err := k.ReadSubKeyNames(-1)
+	names, err := k.ReadSubKeyNames()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,25 +101,10 @@ func TestCreateOpenDeleteKey(t *testing.T) {
 	}
 }
 
-func equalStringSlice(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	if a == nil {
-		return true
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 type ValueTest struct {
 	Type     uint32
 	Name     string
-	Value    interface{}
+	Value    any
 	WillFail bool
 }
 
@@ -190,7 +176,7 @@ func setValues(t *testing.T, k registry.Key) {
 }
 
 func enumerateValues(t *testing.T, k registry.Key) {
-	names, err := k.ReadValueNames(-1)
+	names, err := k.ReadValueNames()
 	if err != nil {
 		t.Error(err)
 		return
@@ -213,7 +199,7 @@ func enumerateValues(t *testing.T, k registry.Key) {
 		}
 	}
 	for n, v := range haveNames {
-		t.Errorf("value %s (%v) is found while enumerating, but has not been cretaed", n, v)
+		t.Errorf("value %s (%v) is found while enumerating, but has not been created", n, v)
 	}
 }
 
@@ -304,7 +290,7 @@ func testGetStringsValue(t *testing.T, k registry.Key, test ValueTest) {
 		t.Errorf("GetStringsValue(%s) failed: %v", test.Name, err)
 		return
 	}
-	if !equalStringSlice(got, test.Value.([]string)) {
+	if !slices.Equal(got, test.Value.([]string)) {
 		t.Errorf("want %s value %#v, got %#v", test.Name, test.Value, got)
 		return
 	}
@@ -335,7 +321,7 @@ func testGetValue(t *testing.T, k registry.Key, test ValueTest, size int) {
 	// read data with short buffer
 	gotsize, gottype, err = k.GetValue(test.Name, make([]byte, size-1))
 	if err == nil {
-		t.Errorf("GetValue(%s, [%d]byte) should fail, but suceeded", test.Name, size-1)
+		t.Errorf("GetValue(%s, [%d]byte) should fail, but succeeded", test.Name, size-1)
 		return
 	}
 	if err != registry.ErrShortBuffer {
@@ -480,7 +466,7 @@ func deleteValues(t *testing.T, k registry.Key) {
 			continue
 		}
 	}
-	names, err := k.ReadValueNames(-1)
+	names, err := k.ReadValueNames()
 	if err != nil {
 		t.Error(err)
 		return
@@ -520,86 +506,6 @@ func TestValues(t *testing.T) {
 	testStat(t, k)
 
 	deleteValues(t, k)
-}
-
-func walkKey(t *testing.T, k registry.Key, kname string) {
-	names, err := k.ReadValueNames(-1)
-	if err != nil {
-		t.Fatalf("reading value names of %s failed: %v", kname, err)
-	}
-	for _, name := range names {
-		_, valtype, err := k.GetValue(name, nil)
-		if err != nil {
-			t.Fatalf("reading value type of %s of %s failed: %v", name, kname, err)
-		}
-		switch valtype {
-		case registry.NONE:
-		case registry.SZ:
-			_, _, err := k.GetStringValue(name)
-			if err != nil {
-				t.Error(err)
-			}
-		case registry.EXPAND_SZ:
-			s, _, err := k.GetStringValue(name)
-			if err != nil {
-				t.Error(err)
-			}
-			_, err = registry.ExpandString(s)
-			if err != nil {
-				t.Error(err)
-			}
-		case registry.DWORD, registry.QWORD:
-			_, _, err := k.GetIntegerValue(name)
-			if err != nil {
-				t.Error(err)
-			}
-		case registry.BINARY:
-			_, _, err := k.GetBinaryValue(name)
-			if err != nil {
-				t.Error(err)
-			}
-		case registry.MULTI_SZ:
-			_, _, err := k.GetStringsValue(name)
-			if err != nil {
-				t.Error(err)
-			}
-		case registry.FULL_RESOURCE_DESCRIPTOR, registry.RESOURCE_LIST, registry.RESOURCE_REQUIREMENTS_LIST:
-			// TODO: not implemented
-		default:
-			t.Fatalf("value type %d of %s of %s failed: %v", valtype, name, kname, err)
-		}
-	}
-
-	names, err = k.ReadSubKeyNames(-1)
-	if err != nil {
-		t.Fatalf("reading sub-keys of %s failed: %v", kname, err)
-	}
-	for _, name := range names {
-		func() {
-			subk, err := registry.OpenKey(k, name, registry.ENUMERATE_SUB_KEYS|registry.QUERY_VALUE)
-			if err != nil {
-				if err == syscall.ERROR_ACCESS_DENIED {
-					// ignore error, if we are not allowed to access this key
-					return
-				}
-				t.Fatalf("opening sub-keys %s of %s failed: %v", name, kname, err)
-			}
-			defer subk.Close()
-
-			walkKey(t, subk, kname+`\`+name)
-		}()
-	}
-}
-
-func TestWalkFullRegistry(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping long running test in short mode")
-	}
-	walkKey(t, registry.CLASSES_ROOT, "CLASSES_ROOT")
-	walkKey(t, registry.CURRENT_USER, "CURRENT_USER")
-	walkKey(t, registry.LOCAL_MACHINE, "LOCAL_MACHINE")
-	walkKey(t, registry.USERS, "USERS")
-	walkKey(t, registry.CURRENT_CONFIG, "CURRENT_CONFIG")
 }
 
 func TestExpandString(t *testing.T) {
@@ -679,12 +585,6 @@ func TestInvalidValues(t *testing.T) {
 }
 
 func TestGetMUIStringValue(t *testing.T) {
-	if err := registry.LoadRegLoadMUIString(); err != nil {
-		t.Skip("regLoadMUIString not supported; skipping")
-	}
-	if err := procGetDynamicTimeZoneInformation.Find(); err != nil {
-		t.Skipf("%s not supported; skipping", procGetDynamicTimeZoneInformation.Name)
-	}
 	var dtzi DynamicTimezoneinformation
 	if _, err := GetDynamicTimeZoneInformation(&dtzi); err != nil {
 		t.Fatal(err)
@@ -697,17 +597,19 @@ func TestGetMUIStringValue(t *testing.T) {
 	}
 	defer timezoneK.Close()
 
-	var tests = []struct {
-		key  registry.Key
+	type testType struct {
 		name string
 		want string
-	}{
-		{key: timezoneK, name: "MUI_Std", want: syscall.UTF16ToString(dtzi.StandardName[:])},
-		{key: timezoneK, name: "MUI_Dlt", want: syscall.UTF16ToString(dtzi.DaylightName[:])},
+	}
+	var tests = []testType{
+		{"MUI_Std", syscall.UTF16ToString(dtzi.StandardName[:])},
+	}
+	if dtzi.DynamicDaylightTimeDisabled == 0 {
+		tests = append(tests, testType{"MUI_Dlt", syscall.UTF16ToString(dtzi.DaylightName[:])})
 	}
 
 	for _, test := range tests {
-		got, err := test.key.GetMUIStringValue(test.name)
+		got, err := timezoneK.GetMUIStringValue(test.name)
 		if err != nil {
 			t.Error("GetMUIStringValue:", err)
 		}
@@ -731,9 +633,9 @@ type DynamicTimezoneinformation struct {
 }
 
 var (
-	kernel32DLL = syscall.NewLazyDLL("kernel32")
+	modkernel32 = syscall.NewLazyDLL("kernel32.dll")
 
-	procGetDynamicTimeZoneInformation = kernel32DLL.NewProc("GetDynamicTimeZoneInformation")
+	procGetDynamicTimeZoneInformation = modkernel32.NewProc("GetDynamicTimeZoneInformation")
 )
 
 func GetDynamicTimeZoneInformation(dtzi *DynamicTimezoneinformation) (rc uint32, err error) {

@@ -1,16 +1,42 @@
-// Copyright 2012 The Go Authors.  All rights reserved.
+// Copyright 2012 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package runtime_test
 
 import (
+	"flag"
+	"internal/asan"
+	"internal/cpu"
+	"internal/msan"
+	"internal/race"
+	"internal/runtime/atomic"
+	"internal/testenv"
 	"io"
+	"math/bits"
 	. "runtime"
 	"runtime/debug"
+	"slices"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 	"unsafe"
 )
+
+// flagQuick is set by the -quick option to skip some relatively slow tests.
+// This is used by the cmd/dist test runtime:cpu124.
+// The cmd/dist test passes both -test.short and -quick;
+// there are tests that only check testing.Short, and those tests will
+// not be skipped if only -quick is used.
+var flagQuick = flag.Bool("quick", false, "skip slow tests, for cmd/dist test runtime:cpu124")
+
+func init() {
+	// We're testing the runtime, so make tracebacks show things
+	// in the runtime. This only raises the level, so it won't
+	// override GOTRACEBACK=crash from the user.
+	SetTracebackEnv("system")
+}
 
 var errf error
 
@@ -42,6 +68,35 @@ func BenchmarkIfaceCmpNil100(b *testing.B) {
 	}
 }
 
+var efaceCmp1 any
+var efaceCmp2 any
+
+func BenchmarkEfaceCmpDiff(b *testing.B) {
+	x := 5
+	efaceCmp1 = &x
+	y := 6
+	efaceCmp2 = &y
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < 100; j++ {
+			if efaceCmp1 == efaceCmp2 {
+				b.Fatal("bad comparison")
+			}
+		}
+	}
+}
+
+func BenchmarkEfaceCmpDiffIndirect(b *testing.B) {
+	efaceCmp1 = [2]int{1, 2}
+	efaceCmp2 = [2]int{1, 2}
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < 100; j++ {
+			if efaceCmp1 != efaceCmp2 {
+				b.Fatal("bad comparison")
+			}
+		}
+	}
+}
+
 func BenchmarkDefer(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		defer1()
@@ -54,7 +109,6 @@ func defer1() {
 			panic("bad recover")
 		}
 	}(1, 2, 3)
-	return
 }
 
 func BenchmarkDefer10(b *testing.B) {
@@ -83,6 +137,21 @@ func BenchmarkDeferMany(b *testing.B) {
 	}
 }
 
+func BenchmarkPanicRecover(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		defer3()
+	}
+}
+
+func defer3() {
+	defer func(x, y, z int) {
+		if recover() == nil {
+			panic("failed recover")
+		}
+	}(1, 2, 3)
+	panic("hi")
+}
+
 // golang.org/issue/7063
 func TestStopCPUProfilingWithProfilerOff(t *testing.T) {
 	SetCPUProfileRate(0)
@@ -97,7 +166,7 @@ func TestStopCPUProfilingWithProfilerOff(t *testing.T) {
 // of the larger addresses must themselves be invalid addresses.
 // We might get unlucky and the OS might have mapped one of these
 // addresses, but probably not: they're all in the first page, very high
-// adderesses that normally an OS would reserve for itself, or malformed
+// addresses that normally an OS would reserve for itself, or malformed
 // addresses. Even so, we might have to remove one or two on different
 // systems. We will see.
 
@@ -138,9 +207,14 @@ func TestSetPanicOnFault(t *testing.T) {
 	}
 }
 
+// testSetPanicOnFault tests one potentially faulting address.
+// It deliberately constructs and uses an invalid pointer,
+// so mark it as nocheckptr.
+//
+//go:nocheckptr
 func testSetPanicOnFault(t *testing.T, addr uintptr, nfault *int) {
-	if GOOS == "nacl" {
-		t.Skip("nacl doesn't seem to fault on high addresses")
+	if GOOS == "js" || GOOS == "wasip1" {
+		t.Skip(GOOS + " does not support catching faults")
 	}
 
 	defer func() {
@@ -172,9 +246,9 @@ func eqstring_generic(s1, s2 string) bool {
 }
 
 func TestEqString(t *testing.T) {
-	// This isn't really an exhaustive test of eqstring, it's
+	// This isn't really an exhaustive test of == on strings, it's
 	// just a convenient way of documenting (via eqstring_generic)
-	// what eqstring does.
+	// what == does.
 	s := []string{
 		"",
 		"a",
@@ -189,7 +263,7 @@ func TestEqString(t *testing.T) {
 			x := s1 == s2
 			y := eqstring_generic(s1, s2)
 			if x != y {
-				t.Errorf(`eqstring("%s","%s") = %t, want %t`, s1, s2, x, y)
+				t.Errorf(`("%s" == "%s") = %t, want %t`, s1, s2, x, y)
 			}
 		}
 	}
@@ -208,8 +282,8 @@ func TestTrailingZero(t *testing.T) {
 		n int64
 		z struct{}
 	}
-	if unsafe.Sizeof(T2{}) != 8+unsafe.Sizeof(Uintreg(0)) {
-		t.Errorf("sizeof(%#v)==%d, want %d", T2{}, unsafe.Sizeof(T2{}), 8+unsafe.Sizeof(Uintreg(0)))
+	if unsafe.Sizeof(T2{}) != 8+unsafe.Sizeof(uintptr(0)) {
+		t.Errorf("sizeof(%#v)==%d, want %d", T2{}, unsafe.Sizeof(T2{}), 8+unsafe.Sizeof(uintptr(0)))
 	}
 	type T3 struct {
 		n byte
@@ -236,33 +310,7 @@ func TestTrailingZero(t *testing.T) {
 	}
 }
 
-func TestBadOpen(t *testing.T) {
-	if GOOS == "windows" || GOOS == "nacl" {
-		t.Skip("skipping OS that doesn't have open/read/write/close")
-	}
-	// make sure we get the correct error code if open fails.  Same for
-	// read/write/close on the resulting -1 fd.  See issue 10052.
-	nonfile := []byte("/notreallyafile")
-	fd := Open(&nonfile[0], 0, 0)
-	if fd != -1 {
-		t.Errorf("open(\"%s\")=%d, want -1", string(nonfile), fd)
-	}
-	var buf [32]byte
-	r := Read(-1, unsafe.Pointer(&buf[0]), int32(len(buf)))
-	if r != -1 {
-		t.Errorf("read()=%d, want -1", r)
-	}
-	w := Write(^uintptr(0), unsafe.Pointer(&buf[0]), int32(len(buf)))
-	if w != -1 {
-		t.Errorf("write()=%d, want -1", w)
-	}
-	c := Close(-1)
-	if c != -1 {
-		t.Errorf("close()=%d, want -1", c)
-	}
-}
-
-func TestAppendGrowth(t *testing.T) {
+func TestAppendGrowthHeap(t *testing.T) {
 	var x []int64
 	check := func(want int) {
 		if cap(x) != want {
@@ -277,6 +325,32 @@ func TestAppendGrowth(t *testing.T) {
 		check(want)
 		if i&(i-1) == 0 {
 			want = 2 * i
+		}
+	}
+	Escape(&x[0]) // suppress stack-allocated backing store
+}
+
+func TestAppendGrowthStack(t *testing.T) {
+	if race.Enabled || asan.Enabled || msan.Enabled {
+		t.Skip("instrumentation breaks this optimization")
+	}
+	var x []int64
+	check := func(want int) {
+		if cap(x) != want {
+			t.Errorf("len=%d, cap=%d, want cap=%d", len(x), cap(x), want)
+		}
+	}
+
+	check(0)
+	want := 32 / 8 // 32 is the default for cmd/compile/internal/base.DebugFlags.VariableMakeThreshold
+	if testenv.OptimizationOff() {
+		want = 1
+	}
+	for i := 1; i <= 100; i++ {
+		x = append(x, 1)
+		check(want)
+		if i&(i-1) == 0 {
+			want = max(want, 2*i)
 		}
 	}
 }
@@ -300,4 +374,447 @@ func TestAppendSliceGrowth(t *testing.T) {
 			want = 2 * i
 		}
 	}
+}
+
+func TestGoroutineProfileTrivial(t *testing.T) {
+	// Calling GoroutineProfile twice in a row should find the same number of goroutines,
+	// but it's possible there are goroutines just about to exit, so we might end up
+	// with fewer in the second call. Try a few times; it should converge once those
+	// zombies are gone.
+	for i := 0; ; i++ {
+		n1, ok := GoroutineProfile(nil) // should fail, there's at least 1 goroutine
+		if n1 < 1 || ok {
+			t.Fatalf("GoroutineProfile(nil) = %d, %v, want >0, false", n1, ok)
+		}
+		n2, ok := GoroutineProfile(make([]StackRecord, n1))
+		if n2 == n1 && ok {
+			break
+		}
+		t.Logf("GoroutineProfile(%d) = %d, %v, want %d, true", n1, n2, ok, n1)
+		if i >= 10 {
+			t.Fatalf("GoroutineProfile not converging")
+		}
+	}
+}
+
+func BenchmarkGoroutineProfile(b *testing.B) {
+	run := func(fn func() bool) func(b *testing.B) {
+		runOne := func(b *testing.B) {
+			latencies := make([]time.Duration, 0, b.N)
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				start := time.Now()
+				ok := fn()
+				if !ok {
+					b.Fatal("goroutine profile failed")
+				}
+				latencies = append(latencies, time.Since(start))
+			}
+			b.StopTimer()
+
+			// Sort latencies then report percentiles.
+			slices.Sort(latencies)
+			b.ReportMetric(float64(latencies[len(latencies)*50/100]), "p50-ns")
+			b.ReportMetric(float64(latencies[len(latencies)*90/100]), "p90-ns")
+			b.ReportMetric(float64(latencies[len(latencies)*99/100]), "p99-ns")
+		}
+		return func(b *testing.B) {
+			b.Run("idle", runOne)
+
+			b.Run("loaded", func(b *testing.B) {
+				stop := applyGCLoad(b)
+				runOne(b)
+				// Make sure to stop the timer before we wait! The load created above
+				// is very heavy-weight and not easy to stop, so we could end up
+				// confusing the benchmarking framework for small b.N.
+				b.StopTimer()
+				stop()
+			})
+		}
+	}
+
+	// Measure the cost of counting goroutines
+	b.Run("small-nil", run(func() bool {
+		GoroutineProfile(nil)
+		return true
+	}))
+
+	// Measure the cost with a small set of goroutines
+	n := NumGoroutine()
+	p := make([]StackRecord, 2*n+2*GOMAXPROCS(0))
+	b.Run("small", run(func() bool {
+		_, ok := GoroutineProfile(p)
+		return ok
+	}))
+
+	// Measure the cost with a large set of goroutines
+	ch := make(chan int)
+	var ready, done sync.WaitGroup
+	for i := 0; i < 5000; i++ {
+		ready.Add(1)
+		done.Add(1)
+		go func() { ready.Done(); <-ch; done.Done() }()
+	}
+	ready.Wait()
+
+	// Count goroutines with a large allgs list
+	b.Run("large-nil", run(func() bool {
+		GoroutineProfile(nil)
+		return true
+	}))
+
+	n = NumGoroutine()
+	p = make([]StackRecord, 2*n+2*GOMAXPROCS(0))
+	b.Run("large", run(func() bool {
+		_, ok := GoroutineProfile(p)
+		return ok
+	}))
+
+	close(ch)
+	done.Wait()
+
+	// Count goroutines with a large (but unused) allgs list
+	b.Run("sparse-nil", run(func() bool {
+		GoroutineProfile(nil)
+		return true
+	}))
+
+	// Measure the cost of a large (but unused) allgs list
+	n = NumGoroutine()
+	p = make([]StackRecord, 2*n+2*GOMAXPROCS(0))
+	b.Run("sparse", run(func() bool {
+		_, ok := GoroutineProfile(p)
+		return ok
+	}))
+}
+
+func TestVersion(t *testing.T) {
+	// Test that version does not contain \r or \n.
+	vers := Version()
+	if strings.Contains(vers, "\r") || strings.Contains(vers, "\n") {
+		t.Fatalf("cr/nl in version: %q", vers)
+	}
+}
+
+func BenchmarkProcYield(b *testing.B) {
+	benchN := func(n uint32) func(*testing.B) {
+		return func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				ProcYield(n)
+			}
+		}
+	}
+
+	b.Run("1", benchN(1))
+	b.Run("10", benchN(10))
+	b.Run("30", benchN(30)) // active_spin_cnt in lock_sema.go and lock_futex.go
+	b.Run("100", benchN(100))
+	b.Run("1000", benchN(1000))
+}
+
+func BenchmarkOSYield(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		OSYield()
+	}
+}
+
+func BenchmarkUsleep(b *testing.B) {
+	benchN := func(n uint32) func(*testing.B) {
+		return func(b *testing.B) {
+			for b.Loop() {
+				Usleep(n)
+			}
+		}
+	}
+
+	b.Run("1", benchN(1))           // darwin osyield
+	b.Run("3", benchN(3))           // runqgrab
+	b.Run("20", benchN(20))         // sysmon min
+	b.Run("10000", benchN(10*1000)) // sysmon max
+}
+
+func BenchmarkStealRunnextSleep(b *testing.B) {
+	benchN := func(ns int64) func(*testing.B) {
+		return func(b *testing.B) {
+			for b.Loop() {
+				StealRunnextSleep(ns)
+			}
+		}
+	}
+
+	b.Run("3us", benchN(3000))
+}
+
+func BenchmarkNoteTSleep(b *testing.B) {
+	benchN := func(ns int64, fn func(n *Note, ns int64) bool) func(*testing.B) {
+		return func(b *testing.B) {
+			n := new(Note)
+			for b.Loop() {
+				NoteClear(n)
+				woke := fn(n, ns)
+				if woke {
+					b.Fatal("something woke note; we expected timeout")
+				}
+			}
+		}
+	}
+
+	b.Run("g0-100us", benchN(100*1000, NoteTSleepG0)) // stopTheWorldWithSema, forEachPInternal
+	b.Run("g-100us", benchN(100*1000, NoteTSleepG))
+}
+
+func BenchmarkMutexContention(b *testing.B) {
+	// Measure throughput of a single mutex with all threads contending
+	//
+	// Share a single counter across all threads. Progress from any thread is
+	// progress for the benchmark as a whole. We don't measure or give points
+	// for fairness here, arbitrary delay to any given thread's progress is
+	// invisible and allowed.
+	//
+	// The cache line that holds the count value will need to move between
+	// processors, but not as often as the cache line that holds the mutex. The
+	// mutex protects access to the count value, which limits contention on that
+	// cache line. This is a simple design, but it helps to make the behavior of
+	// the benchmark clear. Most real uses of mutex will protect some number of
+	// cache lines anyway.
+
+	var state struct {
+		_     cpu.CacheLinePad
+		lock  Mutex
+		_     cpu.CacheLinePad
+		count atomic.Int64
+		_     cpu.CacheLinePad
+	}
+
+	procs := GOMAXPROCS(0)
+	var wg sync.WaitGroup
+	for range procs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				Lock(&state.lock)
+				ours := state.count.Add(1)
+				Unlock(&state.lock)
+				if ours >= int64(b.N) {
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func BenchmarkMutexCapture(b *testing.B) {
+
+	// Measure mutex fairness.
+	//
+	// Have several threads contend for a single mutex value. Measure how
+	// effectively a single thread is able to capture the lock and report the
+	// duration of those "streak" events. Measure how long other individual
+	// threads need to wait between their turns with the lock. Report the
+	// duration of those "starve" events.
+	//
+	// Report in terms of wall clock time (assuming a constant time per
+	// lock/unlock pair) rather than number of locks/unlocks. This keeps
+	// timekeeping overhead out of the critical path, and avoids giving an
+	// advantage to lock/unlock implementations that take less time per
+	// operation.
+
+	var state struct {
+		_     cpu.CacheLinePad
+		lock  Mutex
+		_     cpu.CacheLinePad
+		count atomic.Int64
+		_     cpu.CacheLinePad
+	}
+
+	procs := GOMAXPROCS(0)
+	var wg sync.WaitGroup
+	histograms := make(chan [2][65]int)
+	for range procs {
+		wg.Add(1)
+		go func() {
+			var (
+				prev      int64
+				streak    int64
+				histogram [2][65]int
+			)
+			for {
+				Lock(&state.lock)
+				ours := state.count.Add(1)
+				Unlock(&state.lock)
+				delta := ours - prev - 1
+				prev = ours
+				if delta == 0 {
+					streak++
+				} else {
+					histogram[0][bits.LeadingZeros64(uint64(streak))]++
+					histogram[1][bits.LeadingZeros64(uint64(delta))]++
+					streak = 1
+				}
+				if ours >= int64(b.N) {
+					wg.Done()
+					if delta == 0 {
+						histogram[0][bits.LeadingZeros64(uint64(streak))]++
+						histogram[1][bits.LeadingZeros64(uint64(delta))]++
+					}
+					histograms <- histogram
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	b.StopTimer()
+
+	var histogram [2][65]int
+	for range procs {
+		h := <-histograms
+		for i := range h {
+			for j := range h[i] {
+				histogram[i][j] += h[i][j]
+			}
+		}
+	}
+
+	percentile := func(h [65]int, p float64) int {
+		sum := 0
+		for i, v := range h {
+			bound := uint64(1<<63) >> i
+			sum += int(bound) * v
+		}
+
+		// Imagine that the longest streak / starvation events were instead half
+		// as long but twice in number. (Note that we've pre-multiplied by the
+		// [lower] "bound" value.) Continue those splits until we meet the
+		// percentile target.
+		part := 0
+		for i, v := range h {
+			bound := uint64(1<<63) >> i
+			part += int(bound) * v
+			// have we trimmed off enough at the head to dip below the percentile goal
+			if float64(sum-part) < float64(sum)*p {
+				return int(bound)
+			}
+		}
+
+		return 0
+	}
+
+	perOp := float64(b.Elapsed().Nanoseconds()) / float64(b.N)
+	b.ReportMetric(perOp*float64(percentile(histogram[0], 1.0)), "ns/streak-p100")
+	b.ReportMetric(perOp*float64(percentile(histogram[0], 0.9)), "ns/streak-p90")
+	b.ReportMetric(perOp*float64(percentile(histogram[1], 1.0)), "ns/starve-p100")
+	b.ReportMetric(perOp*float64(percentile(histogram[1], 0.9)), "ns/starve-p90")
+}
+
+func BenchmarkMutexHandoff(b *testing.B) {
+	testcase := func(delay func(l *Mutex)) func(b *testing.B) {
+		return func(b *testing.B) {
+			if workers := 2; GOMAXPROCS(0) < workers {
+				b.Skipf("requires GOMAXPROCS >= %d", workers)
+			}
+
+			// Measure latency of mutex handoff between threads.
+			//
+			// Hand off a runtime.mutex between two threads, one running a
+			// "coordinator" goroutine and the other running a "worker"
+			// goroutine. We don't override the runtime's typical
+			// goroutine/thread mapping behavior.
+			//
+			// Measure the latency, starting when the coordinator enters a call
+			// to runtime.unlock and ending when the worker's call to
+			// runtime.lock returns. The benchmark can specify a "delay"
+			// function to simulate the length of the mutex-holder's critical
+			// section, including to arrange for the worker's thread to be in
+			// either the "spinning" or "sleeping" portions of the runtime.lock2
+			// implementation. Measurement starts after any such "delay".
+			//
+			// The two threads' goroutines communicate their current position to
+			// each other in a non-blocking way via the "turn" state.
+
+			var state struct {
+				_    cpu.CacheLinePad
+				lock Mutex
+				_    cpu.CacheLinePad
+				turn atomic.Int64
+				_    cpu.CacheLinePad
+			}
+
+			var delta atomic.Int64
+			var wg sync.WaitGroup
+
+			// coordinator:
+			//  - acquire the mutex
+			//  - set the turn to 2 mod 4, instructing the worker to begin its Lock call
+			//  - wait until the mutex is contended
+			//  - wait a bit more so the worker can commit to its sleep
+			//  - release the mutex and wait for it to be our turn (0 mod 4) again
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var t int64
+				for range b.N {
+					Lock(&state.lock)
+					state.turn.Add(2)
+					delay(&state.lock)
+					t -= Nanotime() // start the timer
+					Unlock(&state.lock)
+					for state.turn.Load()&0x2 != 0 {
+					}
+				}
+				state.turn.Add(1)
+				delta.Add(t)
+			}()
+
+			// worker:
+			//  - wait until its our turn (2 mod 4)
+			//  - acquire and release the mutex
+			//  - switch the turn counter back to the coordinator (0 mod 4)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var t int64
+				for {
+					switch state.turn.Load() & 0x3 {
+					case 0:
+					case 1, 3:
+						delta.Add(t)
+						return
+					case 2:
+						Lock(&state.lock)
+						t += Nanotime() // stop the timer
+						Unlock(&state.lock)
+						state.turn.Add(2)
+					}
+				}
+			}()
+
+			wg.Wait()
+			b.ReportMetric(float64(delta.Load())/float64(b.N), "ns/op")
+		}
+	}
+
+	b.Run("Solo", func(b *testing.B) {
+		var lock Mutex
+		for range b.N {
+			Lock(&lock)
+			Unlock(&lock)
+		}
+	})
+
+	b.Run("FastPingPong", testcase(func(l *Mutex) {}))
+	b.Run("SlowPingPong", testcase(func(l *Mutex) {
+		// Wait for the worker to stop spinning and prepare to sleep
+		for !MutexContended(l) {
+		}
+		// Wait a bit longer so the OS can finish committing the worker to its
+		// sleep. Balance consistency against getting enough iterations.
+		const extraNs = 10e3
+		for t0 := Nanotime(); Nanotime()-t0 < extraNs; {
+		}
+	}))
 }

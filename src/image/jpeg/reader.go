@@ -4,7 +4,7 @@
 
 // Package jpeg implements a JPEG image decoder and encoder.
 //
-// JPEG is defined in ITU-T T.81: http://www.w3.org/Graphics/JPEG/itu-t81.pdf.
+// JPEG is defined in ITU-T T.81: https://www.w3.org/Graphics/JPEG/itu-t81.pdf.
 package jpeg
 
 import (
@@ -13,9 +13,6 @@ import (
 	"image/internal/imageutil"
 	"io"
 )
-
-// TODO(nigeltao): fix up the doc comment style so that sentences start with
-// the name of the type or function that they annotate.
 
 // A FormatError reports that the input is not a valid JPEG.
 type FormatError string
@@ -31,10 +28,12 @@ var errUnsupportedSubsamplingRatio = UnsupportedError("luma/chroma subsampling r
 
 // Component specification, specified in section B.2.2.
 type component struct {
-	h  int   // Horizontal sampling factor.
-	v  int   // Vertical sampling factor.
-	c  uint8 // Component identifier.
-	tq uint8 // Quantization table destination selector.
+	h       int   // Horizontal sampling factor.
+	v       int   // Vertical sampling factor.
+	c       uint8 // Component identifier.
+	tq      uint8 // Quantization table destination selector.
+	expandH int   // Horizontal expansion factor for non-standard subsampling.
+	expandV int   // Vertical expansion factor for non-standard subsampling.
 }
 
 const (
@@ -48,7 +47,7 @@ const (
 )
 
 const (
-	sof0Marker = 0xc0 // Start Of Frame (Baseline).
+	sof0Marker = 0xc0 // Start Of Frame (Baseline Sequential).
 	sof1Marker = 0xc1 // Start Of Frame (Extended Sequential).
 	sof2Marker = 0xc2 // Start Of Frame (Progressive).
 	dhtMarker  = 0xc4 // Define Huffman Table.
@@ -62,13 +61,13 @@ const (
 	comMarker  = 0xfe // COMment.
 	// "APPlication specific" markers aren't part of the JPEG spec per se,
 	// but in practice, their use is described at
-	// http://www.sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html
+	// https://www.sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html
 	app0Marker  = 0xe0
 	app14Marker = 0xee
 	app15Marker = 0xef
 )
 
-// See http://www.sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#Adobe
+// See https://www.sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#Adobe
 const (
 	adobeTransformUnknown = 0
 	adobeTransformYCbCr   = 1
@@ -89,7 +88,8 @@ var unzig = [blockSize]int{
 	53, 60, 61, 54, 47, 55, 62, 63,
 }
 
-// Deprecated: Reader is deprecated.
+// Deprecated: Reader is not used by the [image/jpeg] package and should
+// not be used by others. It is kept for compatibility.
 type Reader interface {
 	io.ByteReader
 	io.Reader
@@ -126,9 +126,21 @@ type decoder struct {
 	blackPix    []byte
 	blackStride int
 
-	ri                  int // Restart Interval.
-	nComp               int
-	progressive         bool
+	// For non-standard subsampling ratios (flex mode).
+	flex       bool // True if using non-standard subsampling that requires manual pixel expansion.
+	maxH, maxV int  // Maximum horizontal and vertical sampling factors across all components.
+
+	ri    int // Restart Interval.
+	nComp int
+
+	// As per section 4.5, there are four modes of operation (selected by the
+	// SOF? markers): sequential DCT, progressive DCT, lossless and
+	// hierarchical, although this implementation does not support the latter
+	// two non-DCT modes. Sequential DCT is further split into baseline and
+	// extended, as per section 4.11.
+	baseline    bool
+	progressive bool
+
 	jfif                bool
 	adobeTransformValid bool
 	adobeTransform      uint8
@@ -158,7 +170,10 @@ func (d *decoder) fill() error {
 	n, err := d.r.Read(d.bytes.buf[d.bytes.j:])
 	d.bytes.j += n
 	if n > 0 {
-		err = nil
+		return nil
+	}
+	if err == io.EOF {
+		err = io.ErrUnexpectedEOF
 	}
 	return err
 }
@@ -255,9 +270,6 @@ func (d *decoder) readFull(p []byte) error {
 			break
 		}
 		if err := d.fill(); err != nil {
-			if err == io.EOF {
-				err = io.ErrUnexpectedEOF
-			}
 			return err
 		}
 	}
@@ -285,9 +297,6 @@ func (d *decoder) ignore(n int) error {
 			break
 		}
 		if err := d.fill(); err != nil {
-			if err == io.EOF {
-				err = io.ErrUnexpectedEOF
-			}
 			return err
 		}
 	}
@@ -361,30 +370,11 @@ func (d *decoder) processSOF(n int) error {
 			h, v = 1, 1
 
 		case 3:
-			// For YCbCr images, we only support 4:4:4, 4:4:0, 4:2:2, 4:2:0,
-			// 4:1:1 or 4:1:0 chroma subsampling ratios. This implies that the
-			// (h, v) values for the Y component are either (1, 1), (1, 2),
-			// (2, 1), (2, 2), (4, 1) or (4, 2), and the Y component's values
-			// must be a multiple of the Cb and Cr component's values. We also
-			// assume that the two chroma components have the same subsampling
-			// ratio.
-			switch i {
-			case 0: // Y.
-				// We have already verified, above, that h and v are both
-				// either 1, 2 or 4, so invalid (h, v) combinations are those
-				// with v == 4.
-				if v == 4 {
-					return errUnsupportedSubsamplingRatio
-				}
-			case 1: // Cb.
-				if d.comp[0].h%h != 0 || d.comp[0].v%v != 0 {
-					return errUnsupportedSubsamplingRatio
-				}
-			case 2: // Cr.
-				if d.comp[1].h != h || d.comp[1].v != v {
-					return errUnsupportedSubsamplingRatio
-				}
-			}
+			// For YCbCr images, we support both standard subsampling ratios
+			// (4:4:4, 4:4:0, 4:2:2, 4:2:0, 4:1:1, 4:1:0) and non-standard ratios
+			// where components may have different sampling factors. The only
+			// restriction is that each component's sampling factors must evenly
+			// divide the maximum factors (validated after the loop).
 
 		case 4:
 			// For 4-component images (either CMYK or YCbCrK), we only support two
@@ -412,9 +402,27 @@ func (d *decoder) processSOF(n int) error {
 			}
 		}
 
+		d.maxH, d.maxV = max(d.maxH, h), max(d.maxV, v)
 		d.comp[i].h = h
 		d.comp[i].v = v
 	}
+
+	// For 3-component images, validate that maxH and maxV are evenly divisible
+	// by each component's sampling factors.
+	if d.nComp == 3 {
+		for i := 0; i < 3; i++ {
+			if d.maxH%d.comp[i].h != 0 || d.maxV%d.comp[i].v != 0 {
+				return errUnsupportedSubsamplingRatio
+			}
+		}
+	}
+
+	// Compute expansion factors for each component.
+	for i := 0; i < d.nComp; i++ {
+		d.comp[i].expandH = d.maxH / d.comp[i].h
+		d.comp[i].expandV = d.maxV / d.comp[i].v
+	}
+
 	return nil
 }
 
@@ -596,6 +604,7 @@ func (d *decoder) decode(r io.Reader, configOnly bool) (image.Image, error) {
 
 		switch marker {
 		case sof0Marker, sof1Marker, sof2Marker:
+			d.baseline = marker == sof0Marker
 			d.progressive = marker == sof2Marker
 			err = d.processSOF(n)
 			if configOnly && d.jfif {
@@ -641,6 +650,12 @@ func (d *decoder) decode(r io.Reader, configOnly bool) (image.Image, error) {
 			return nil, err
 		}
 	}
+
+	if d.progressive {
+		if err := d.reconstructProgressiveImage(); err != nil {
+			return nil, err
+		}
+	}
 	if d.img1 != nil {
 		return d.img1, nil
 	}
@@ -669,7 +684,7 @@ func (d *decoder) applyBlack() (image.Image, error) {
 
 	// If the 4-component JPEG image isn't explicitly marked as "Unknown (RGB
 	// or CMYK)" as per
-	// http://www.sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#Adobe
+	// https://www.sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#Adobe
 	// we assume that it is YCbCrK. This matches libjpeg's jdapimin.c.
 	if d.adobeTransform != adobeTransformUnknown {
 		// Convert the YCbCr part of the YCbCrK to RGB, invert the RGB to get
@@ -732,7 +747,7 @@ func (d *decoder) isRGB() bool {
 		return false
 	}
 	if d.adobeTransformValid && d.adobeTransform == adobeTransformUnknown {
-		// http://www.sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#Adobe
+		// https://www.sno.phy.queensu.ca/~phil/exiftool/TagNames/JPEG.html#Adobe
 		// says that 0 means Unknown (and in practice RGB) and 1 means YCbCr.
 		return true
 	}
@@ -740,7 +755,27 @@ func (d *decoder) isRGB() bool {
 }
 
 func (d *decoder) convertToRGB() (image.Image, error) {
-	cScale := d.comp[0].h / d.comp[1].h
+	// Historically, we only supported 4:4:4, 4:4:0, 4:2:2, 4:2:0, 4:1:1 or
+	// 4:1:0 chroma subsampling ratios. Other configurations (including situations
+	// where Chroma-Blue and Chroma-Red have different subsampling) are very rare,
+	// but not impossible. That restriction was relaxed in Go 1.27 (2026).
+	//
+	// It's also very rare but not impossible for 3-channel JPEG images to be
+	// RGB instead of YCbCr, in which case this convertToRGB function will be
+	// called. Note that RGB-instead-of-YCbCr is a property of the JPEG file
+	// itself (in the SOF marker), not of the Go code decoding the image.
+	//
+	// convertToRGB still makes those historical assumptions and does not
+	// support the intersection of (1) atypical chroma subsampling and (2)
+	// RGB-instead-of-YCbCr. Both of those are very rare and the intersection
+	// is even more so.
+	h0, h1, h2 := d.comp[0].h, d.comp[1].h, d.comp[2].h
+	v0, v1, v2 := d.comp[0].v, d.comp[1].v, d.comp[2].v
+	if (h1 != h2) || (h0%h1 != 0) || (v1 != v2) || (v0%v1 != 0) {
+		return nil, errUnsupportedSubsamplingRatio
+	}
+
+	cScale := h0 / h1
 	bounds := d.img3.Bounds()
 	img := image.NewRGBA(bounds)
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
@@ -757,7 +792,7 @@ func (d *decoder) convertToRGB() (image.Image, error) {
 	return img, nil
 }
 
-// Decode reads a JPEG image from r and returns it as an image.Image.
+// Decode reads a JPEG image from r and returns it as an [image.Image].
 func Decode(r io.Reader) (image.Image, error) {
 	var d decoder
 	return d.decode(r, false)

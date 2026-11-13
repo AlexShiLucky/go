@@ -4,25 +4,35 @@
 
 // Package types declares the data types and implements
 // the algorithms for type-checking of Go packages. Use
-// Config.Check to invoke the type checker for a package.
-// Alternatively, create a new type checked with NewChecker
-// and invoke it incrementally by calling Checker.Files.
+// [Config.Check] to invoke the type checker for a package.
+// Alternatively, create a new type checker with [NewChecker]
+// and invoke it incrementally by calling [Checker.Files].
 //
 // Type-checking consists of several interdependent phases:
 //
-// Name resolution maps each identifier (ast.Ident) in the program to the
-// language object (Object) it denotes.
-// Use Info.{Defs,Uses,Implicits} for the results of name resolution.
+// Name resolution maps each identifier ([ast.Ident]) in the program
+// to the symbol ([Object]) it denotes. Use the Defs and Uses fields
+// of [Info] or the [Info.ObjectOf] method to find the symbol for an
+// identifier, and use the Implicits field of [Info] to find the
+// symbol for certain other kinds of syntax node.
 //
-// Constant folding computes the exact constant value (constant.Value)
-// for every expression (ast.Expr) that is a compile-time constant.
-// Use Info.Types[expr].Value for the results of constant folding.
+// Constant folding computes the exact constant value
+// ([constant.Value]) of every expression ([ast.Expr]) that is a
+// compile-time constant. Use the Types field of [Info] to find the
+// results of constant folding for an expression.
 //
-// Type inference computes the type (Type) of every expression (ast.Expr)
-// and checks for compliance with the language specification.
-// Use Info.Types[expr].Type for the results of type inference.
+// Type deduction computes the type ([Type]) of every expression
+// ([ast.Expr]) and checks for compliance with the language
+// specification. Use the Types field of [Info] for the results of
+// type deduction.
 //
-package types // import "go/types"
+// Applications that need to type-check one or more complete packages
+// of Go source code may find it more convenient not to invoke the
+// type checker directly but instead to use the Load function in
+// package [golang.org/x/tools/go/packages].
+//
+// For a tutorial, see https://go.dev/s/types-tutorial.
+package types
 
 import (
 	"bytes"
@@ -30,6 +40,8 @@ import (
 	"go/ast"
 	"go/constant"
 	"go/token"
+	. "internal/types/errors"
+	_ "unsafe" // for linkname
 )
 
 // An Error describes a type-checking error; it implements the error interface.
@@ -41,6 +53,15 @@ type Error struct {
 	Pos  token.Pos      // error position
 	Msg  string         // error message
 	Soft bool           // if set, error is "soft"
+
+	// go116code is a future API, unexported as the set of error codes is large
+	// and likely to change significantly during experimentation. Tools wishing
+	// to preview this feature may read go116code using reflection (see
+	// errorcodes_test.go), but beware that there is no guarantee of future
+	// compatibility.
+	go116code  Code
+	go116start token.Pos
+	go116end   token.Pos
 }
 
 // Error returns an error string formatted as follows:
@@ -49,19 +70,67 @@ func (err Error) Error() string {
 	return fmt.Sprintf("%s: %s", err.Fset.Position(err.Pos), err.Msg)
 }
 
-// An importer resolves import paths to Packages.
-// See go/importer for existing implementations.
+// An ArgumentError holds an error associated with an argument index.
+type ArgumentError struct {
+	Index int
+	Err   error
+}
+
+func (e *ArgumentError) Error() string { return e.Err.Error() }
+func (e *ArgumentError) Unwrap() error { return e.Err }
+
+// An Importer resolves import paths to Packages.
+//
+// CAUTION: This interface does not support the import of locally
+// vendored packages. See https://golang.org/s/go15vendor.
+// If possible, external implementations should implement [ImporterFrom].
 type Importer interface {
-	// Import returns the imported package for the given import
-	// path, or an error if the package couldn't be imported.
-	// Import is responsible for returning the same package for
-	// matching import paths.
+	// Import returns the imported package for the given import path.
+	// The semantics is like for ImporterFrom.ImportFrom except that
+	// dir and mode are ignored (since they are not present).
 	Import(path string) (*Package, error)
+}
+
+// ImportMode is reserved for future use.
+type ImportMode int
+
+// An ImporterFrom resolves import paths to packages; it
+// supports vendoring per https://golang.org/s/go15vendor.
+// Use go/importer to obtain an ImporterFrom implementation.
+type ImporterFrom interface {
+	// Importer is present for backward-compatibility. Calling
+	// Import(path) is the same as calling ImportFrom(path, "", 0);
+	// i.e., locally vendored packages may not be found.
+	// The types package does not call Import if an ImporterFrom
+	// is present.
+	Importer
+
+	// ImportFrom returns the imported package for the given import
+	// path when imported by a package file located in dir.
+	// If the import failed, besides returning an error, ImportFrom
+	// is encouraged to cache and return a package anyway, if one
+	// was created. This will reduce package inconsistencies and
+	// follow-on type checker errors due to the missing package.
+	// The mode value must be 0; it is reserved for future use.
+	// Two calls to ImportFrom with the same path and dir must
+	// return the same package.
+	ImportFrom(path, dir string, mode ImportMode) (*Package, error)
 }
 
 // A Config specifies the configuration for type checking.
 // The zero value for Config is a ready-to-use default configuration.
 type Config struct {
+	// Context is the context used for resolving global identifiers. If nil, the
+	// type checker will initialize this field with a newly created context.
+	Context *Context
+
+	// GoVersion describes the accepted Go language version. The string must
+	// start with a prefix of the form "go%d.%d" (e.g. "go1.20", "go1.21rc1", or
+	// "go1.21.0") or it must be empty; an empty string disables Go language
+	// version checks. If the format is invalid, invoking the type checker will
+	// result in an error.
+	GoVersion string
+
 	// If IgnoreFuncBodies is set, function bodies are not
 	// type-checked.
 	IgnoreFuncBodies bool
@@ -71,9 +140,21 @@ type Config struct {
 	// identifiers referring to package C (which won't find an object).
 	// This feature is intended for the standard library cmd/api tool.
 	//
-	// Caution: Effects may be unpredictable due to follow-up errors.
+	// Caution: Effects may be unpredictable due to follow-on errors.
 	//          Do not use casually!
 	FakeImportC bool
+
+	// If go115UsesCgo is set, the type checker expects the
+	// _cgo_gotypes.go file generated by running cmd/cgo to be
+	// provided as a package source file. Qualified identifiers
+	// referring to package C will be resolved to cgo-provided
+	// declarations within _cgo_gotypes.go.
+	//
+	// It is an error to set both FakeImportC and go115UsesCgo.
+	go115UsesCgo bool
+
+	// If _Trace is set, a debug trace is printed to stdout.
+	_Trace bool
 
 	// If Error != nil, it is called with each error found
 	// during type checking; err has dynamic type Error.
@@ -84,18 +165,34 @@ type Config struct {
 	// error found.
 	Error func(err error)
 
-	// Importer is called for each import declaration except when
-	// importing package "unsafe". An error is reported if an
-	// importer is needed but none was installed.
+	// An importer is used to import packages referred to from
+	// import declarations.
+	// If the installed importer implements ImporterFrom, the type
+	// checker calls ImportFrom instead of Import.
+	// The type checker reports an error if an importer is needed
+	// but none was installed.
 	Importer Importer
 
 	// If Sizes != nil, it provides the sizing functions for package unsafe.
-	// Otherwise &StdSizes{WordSize: 8, MaxAlign: 8} is used instead.
+	// Otherwise SizesFor("gc", "amd64") is used instead.
 	Sizes Sizes
 
 	// If DisableUnusedImportCheck is set, packages are not checked
 	// for unused imports.
 	DisableUnusedImportCheck bool
+
+	// If a non-empty _ErrorURL format string is provided, it is used
+	// to format an error URL link that is appended to the first line
+	// of an error message. ErrorURL must be a format string containing
+	// exactly one "%s" format, e.g. "[go.dev/e/%s]".
+	_ErrorURL string
+}
+
+// Linkname for use from srcimporter.
+//go:linkname srcimporter_setUsesCgo
+
+func srcimporter_setUsesCgo(conf *Config) {
+	conf.go115UsesCgo = true
 }
 
 // Info holds result type information for a type-checked package.
@@ -104,7 +201,7 @@ type Config struct {
 // be incomplete.
 type Info struct {
 	// Types maps expressions to their types, and for constant
-	// expressions, their values. Invalid expressions are omitted.
+	// expressions, also their values.
 	//
 	// For (possibly parenthesized) identifiers denoting built-in
 	// functions, the recorded signatures are call-site specific:
@@ -112,10 +209,36 @@ type Info struct {
 	// an argument-specific signature. Otherwise, the recorded type
 	// is invalid.
 	//
-	// Identifiers on the lhs of declarations (i.e., the identifiers
-	// which are being declared) are collected in the Defs map.
-	// Identifiers denoting packages are collected in the Uses maps.
+	// The Types map does not record the type of every identifier,
+	// only those that appear where an arbitrary expression is
+	// permitted. For instance:
+	// - an identifier f in a selector expression x.f is found
+	//   only in the Selections map;
+	// - an identifier z in a variable declaration 'var z int'
+	//   is found only in the Defs map;
+	// - an identifier p denoting a package in a qualified
+	//   identifier p.X is found only in the Uses map.
+	//
+	// Similarly, no type is recorded for the (synthetic) FuncType
+	// node in a FuncDecl.Type field, since there is no corresponding
+	// syntactic function type expression in the source in this case
+	// Instead, the function type is found in the Defs map entry for
+	// the corresponding function declaration.
 	Types map[ast.Expr]TypeAndValue
+
+	// Instances maps identifiers denoting generic types or functions to their
+	// type arguments and instantiated type.
+	//
+	// For example, Instances will map the identifier for 'T' in the type
+	// instantiation T[int, string] to the type arguments [int, string] and
+	// resulting instantiated *Named type. Given a generic function
+	// func F[A any](A), Instances will map the identifier for 'F' in the call
+	// expression F(int(1)) to the inferred type arguments [int], and resulting
+	// instantiated *Signature.
+	//
+	// Invariant: Instantiating Uses[id].Type() with Instances[id].TypeArgs
+	// results in an equivalent of Instances[id].Type.
+	Instances map[*ast.Ident]Instance
 
 	// Defs maps identifiers to the objects they define (including
 	// package names, dots "." of dot-imports, and blank "_" identifiers).
@@ -123,14 +246,17 @@ type Info struct {
 	// in package clauses, or symbolic variables t in t := x.(type) of
 	// type switch headers), the corresponding objects are nil.
 	//
-	// For an anonymous field, Defs returns the field *Var it defines.
+	// For an embedded field, Defs returns the field *Var it defines.
+	//
+	// In ill-typed code, such as a duplicate declaration of the
+	// same name, Defs may lack an entry for a declaring identifier.
 	//
 	// Invariant: Defs[id] == nil || Defs[id].Pos() == id.Pos()
 	Defs map[*ast.Ident]Object
 
 	// Uses maps identifiers to the objects they denote.
 	//
-	// For an anonymous field, Uses returns the *TypeName it denotes.
+	// For an embedded field, Uses returns the *TypeName it denotes.
 	//
 	// Invariant: Uses[id].Pos() != id.Pos()
 	Uses map[*ast.Ident]Object
@@ -138,11 +264,11 @@ type Info struct {
 	// Implicits maps nodes to their implicitly declared objects, if any.
 	// The following node and object types may appear:
 	//
-	//	node               declared object
+	//     node               declared object
 	//
-	//	*ast.ImportSpec    *PkgName for dot-imports and imports without renames
-	//	*ast.CaseClause    type-specific *Var for each type switch case clause (incl. default)
-	//      *ast.Field         anonymous struct field or parameter *Var
+	//     *ast.ImportSpec    *PkgName for imports without renames
+	//     *ast.CaseClause    type-specific *Var for each type switch case clause (incl. default)
+	//     *ast.Field         anonymous parameter *Var (incl. unnamed results)
 	//
 	Implicits map[ast.Node]Object
 
@@ -160,18 +286,28 @@ type Info struct {
 	// scope, the function scopes are embedded in the file scope of the file
 	// containing the function declaration.
 	//
+	// The Scope of a function contains the declarations of any
+	// type parameters, parameters, and named results, plus any
+	// local declarations in the body block.
+	// It is coextensive with the complete extent of the
+	// function's syntax ([*ast.FuncDecl] or [*ast.FuncLit]).
+	// The Scopes mapping does not contain an entry for the
+	// function body ([*ast.BlockStmt]); the function's scope is
+	// associated with the [*ast.FuncType].
+	//
 	// The following node types may appear in Scopes:
 	//
-	//	*ast.File
-	//	*ast.FuncType
-	//	*ast.BlockStmt
-	//	*ast.IfStmt
-	//	*ast.SwitchStmt
-	//	*ast.TypeSwitchStmt
-	//	*ast.CaseClause
-	//	*ast.CommClause
-	//	*ast.ForStmt
-	//	*ast.RangeStmt
+	//     *ast.File
+	//     *ast.FuncType
+	//     *ast.TypeSpec
+	//     *ast.BlockStmt
+	//     *ast.IfStmt
+	//     *ast.SwitchStmt
+	//     *ast.TypeSwitchStmt
+	//     *ast.CaseClause
+	//     *ast.CommClause
+	//     *ast.ForStmt
+	//     *ast.RangeStmt
 	//
 	Scopes map[ast.Node]*Scope
 
@@ -181,11 +317,21 @@ type Info struct {
 	// in source order. Variables without an initialization expression do not
 	// appear in this list.
 	InitOrder []*Initializer
+
+	// FileVersions maps a file to its Go version string.
+	// If the file doesn't specify a version, the reported
+	// string is Config.GoVersion.
+	// Version strings begin with “go”, like “go1.21”, and
+	// are suitable for use with the [go/version] package.
+	FileVersions map[*ast.File]string
+}
+
+func (info *Info) recordTypes() bool {
+	return info.Types != nil
 }
 
 // TypeOf returns the type of expression e, or nil if not found.
 // Precondition: the Types, Uses and Defs maps are populated.
-//
 func (info *Info) TypeOf(e ast.Expr) Type {
 	if t, ok := info.Types[e]; ok {
 		return t.Type
@@ -201,16 +347,32 @@ func (info *Info) TypeOf(e ast.Expr) Type {
 // ObjectOf returns the object denoted by the specified id,
 // or nil if not found.
 //
-// If id is an anonymous struct field, ObjectOf returns the field (*Var)
-// it uses, not the type (*TypeName) it defines.
+// If id is an embedded struct field, [Info.ObjectOf] returns the field (*[Var])
+// it defines, not the type (*[TypeName]) it uses.
 //
 // Precondition: the Uses and Defs maps are populated.
-//
 func (info *Info) ObjectOf(id *ast.Ident) Object {
-	if obj, _ := info.Defs[id]; obj != nil {
+	if obj := info.Defs[id]; obj != nil {
 		return obj
 	}
 	return info.Uses[id]
+}
+
+// PkgNameOf returns the local package name defined by the import,
+// or nil if not found.
+//
+// For dot-imports, the package name is ".".
+//
+// Precondition: the Defs and Implicts maps are populated.
+func (info *Info) PkgNameOf(imp *ast.ImportSpec) *PkgName {
+	var obj Object
+	if imp.Name != nil {
+		obj = info.Defs[imp.Name]
+	} else {
+		obj = info.Implicits[imp]
+	}
+	pkgname, _ := obj.(*PkgName)
+	return pkgname
 }
 
 // TypeAndValue reports the type and value (for constants)
@@ -220,9 +382,6 @@ type TypeAndValue struct {
 	Type  Type
 	Value constant.Value
 }
-
-// TODO(gri) Consider eliminating the IsVoid predicate. Instead, report
-// "void" values as regular values but with the empty tuple type.
 
 // IsVoid reports whether the corresponding expression
 // is a function call without results.
@@ -246,7 +405,7 @@ func (tv TypeAndValue) IsBuiltin() bool {
 // nil Value.
 func (tv TypeAndValue) IsValue() bool {
 	switch tv.mode {
-	case constant_, variable, mapindex, value, commaok:
+	case constant_, variable, mapindex, value, commaok, commaerr:
 		return true
 	}
 	return false
@@ -271,9 +430,22 @@ func (tv TypeAndValue) Assignable() bool {
 }
 
 // HasOk reports whether the corresponding expression may be
-// used on the lhs of a comma-ok assignment.
+// used on the rhs of a comma-ok assignment.
 func (tv TypeAndValue) HasOk() bool {
 	return tv.mode == commaok || tv.mode == mapindex
+}
+
+// Instance reports the type arguments and instantiated type for type and
+// function instantiations. For type instantiations, [Type] will be of dynamic
+// type *[Named]. For function instantiations, [Type] will be of dynamic type
+// *Signature.
+type Instance struct {
+	TypeArgs *TypeList
+	Type     Type
+}
+
+func (inst Instance) String() string {
+	return fmt.Sprintf("%s%s", inst.TypeArgs, inst.Type)
 }
 
 // An Initializer describes a package-level variable, or a list of variables in case
@@ -297,10 +469,12 @@ func (init *Initializer) String() string {
 	return buf.String()
 }
 
-// Check type-checks a package and returns the resulting package object,
-// the first error if any, and if info != nil, additional type information.
+// Check type-checks a package and returns the resulting package object and
+// the first error if any. Additionally, if info != nil, Check populates each
+// of the non-nil maps in the [Info] struct.
+//
 // The package is marked as complete if no errors occurred, otherwise it is
-// incomplete. See Config.Error for controlling behavior in the presence of
+// incomplete. See [Config.Error] for controlling behavior in the presence of
 // errors.
 //
 // The package is specified by a list of *ast.Files and corresponding
@@ -309,28 +483,4 @@ func (init *Initializer) String() string {
 func (conf *Config) Check(path string, fset *token.FileSet, files []*ast.File, info *Info) (*Package, error) {
 	pkg := NewPackage(path, "")
 	return pkg, NewChecker(conf, fset, pkg, info).Files(files)
-}
-
-// AssertableTo reports whether a value of type V can be asserted to have type T.
-func AssertableTo(V *Interface, T Type) bool {
-	m, _ := assertableTo(V, T)
-	return m == nil
-}
-
-// AssignableTo reports whether a value of type V is assignable to a variable of type T.
-func AssignableTo(V, T Type) bool {
-	x := operand{mode: value, typ: V}
-	return x.assignableTo(nil, T) // config not needed for non-constant x
-}
-
-// ConvertibleTo reports whether a value of type V is convertible to a value of type T.
-func ConvertibleTo(V, T Type) bool {
-	x := operand{mode: value, typ: V}
-	return x.convertibleTo(nil, T) // config not needed for non-constant x
-}
-
-// Implements reports whether type V implements interface T.
-func Implements(V Type, T *Interface) bool {
-	f, _ := MissingMethod(V, T, true)
-	return f == nil
 }

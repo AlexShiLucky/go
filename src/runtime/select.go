@@ -6,171 +6,43 @@ package runtime
 
 // This file contains the implementation of Go select statements.
 
-import "unsafe"
-
-const (
-	debugSelect = false
-
-	// scase.kind
-	caseRecv = iota
-	caseSend
-	caseDefault
+import (
+	"internal/abi"
+	"internal/runtime/sys"
+	"unsafe"
 )
 
-// Select statement header.
-// Known to compiler.
-// Changes here must also be made in src/cmd/internal/gc/select.go's selecttype.
-type hselect struct {
-	tcase     uint16   // total count of scase[]
-	ncase     uint16   // currently filled scase[]
-	pollorder *uint16  // case poll order
-	lockorder **hchan  // channel lock order
-	scase     [1]scase // one per case (in order of appearance)
-}
+const debugSelect = false
 
 // Select case descriptor.
 // Known to compiler.
-// Changes here must also be made in src/cmd/internal/gc/select.go's selecttype.
+// Changes here must also be made in src/cmd/compile/internal/walk/select.go's scasetype.
 type scase struct {
-	elem        unsafe.Pointer // data element
-	c           *hchan         // chan
-	pc          uintptr        // return pc
-	kind        uint16
-	so          uint16 // vararg of selected bool
-	receivedp   *bool  // pointer to received bool (recv2)
-	releasetime int64
+	c    *hchan         // chan
+	elem unsafe.Pointer // data element
 }
 
 var (
-	chansendpc = funcPC(chansend)
-	chanrecvpc = funcPC(chanrecv)
+	chansendpc = abi.FuncPCABIInternal(chansend)
+	chanrecvpc = abi.FuncPCABIInternal(chanrecv)
 )
 
-func selectsize(size uintptr) uintptr {
-	selsize := unsafe.Sizeof(hselect{}) +
-		(size-1)*unsafe.Sizeof(hselect{}.scase[0]) +
-		size*unsafe.Sizeof(*hselect{}.lockorder) +
-		size*unsafe.Sizeof(*hselect{}.pollorder)
-	return round(selsize, _Int64Align)
+func selectsetpc(pc *uintptr) {
+	*pc = sys.GetCallerPC()
 }
 
-func newselect(sel *hselect, selsize int64, size int32) {
-	if selsize != int64(selectsize(uintptr(size))) {
-		print("runtime: bad select size ", selsize, ", want ", selectsize(uintptr(size)), "\n")
-		throw("bad select size")
-	}
-	sel.tcase = uint16(size)
-	sel.ncase = 0
-	sel.lockorder = (**hchan)(add(unsafe.Pointer(&sel.scase), uintptr(size)*unsafe.Sizeof(hselect{}.scase[0])))
-	sel.pollorder = (*uint16)(add(unsafe.Pointer(sel.lockorder), uintptr(size)*unsafe.Sizeof(*hselect{}.lockorder)))
-
-	if debugSelect {
-		print("newselect s=", sel, " size=", size, "\n")
-	}
-}
-
-//go:nosplit
-func selectsend(sel *hselect, c *hchan, elem unsafe.Pointer) (selected bool) {
-	// nil cases do not compete
-	if c != nil {
-		selectsendImpl(sel, c, getcallerpc(unsafe.Pointer(&sel)), elem, uintptr(unsafe.Pointer(&selected))-uintptr(unsafe.Pointer(&sel)))
-	}
-	return
-}
-
-// cut in half to give stack a chance to split
-func selectsendImpl(sel *hselect, c *hchan, pc uintptr, elem unsafe.Pointer, so uintptr) {
-	i := sel.ncase
-	if i >= sel.tcase {
-		throw("selectsend: too many cases")
-	}
-	sel.ncase = i + 1
-	cas := (*scase)(add(unsafe.Pointer(&sel.scase), uintptr(i)*unsafe.Sizeof(sel.scase[0])))
-
-	cas.pc = pc
-	cas.c = c
-	cas.so = uint16(so)
-	cas.kind = caseSend
-	cas.elem = elem
-
-	if debugSelect {
-		print("selectsend s=", sel, " pc=", hex(cas.pc), " chan=", cas.c, " so=", cas.so, "\n")
-	}
-}
-
-//go:nosplit
-func selectrecv(sel *hselect, c *hchan, elem unsafe.Pointer) (selected bool) {
-	// nil cases do not compete
-	if c != nil {
-		selectrecvImpl(sel, c, getcallerpc(unsafe.Pointer(&sel)), elem, nil, uintptr(unsafe.Pointer(&selected))-uintptr(unsafe.Pointer(&sel)))
-	}
-	return
-}
-
-//go:nosplit
-func selectrecv2(sel *hselect, c *hchan, elem unsafe.Pointer, received *bool) (selected bool) {
-	// nil cases do not compete
-	if c != nil {
-		selectrecvImpl(sel, c, getcallerpc(unsafe.Pointer(&sel)), elem, received, uintptr(unsafe.Pointer(&selected))-uintptr(unsafe.Pointer(&sel)))
-	}
-	return
-}
-
-func selectrecvImpl(sel *hselect, c *hchan, pc uintptr, elem unsafe.Pointer, received *bool, so uintptr) {
-	i := sel.ncase
-	if i >= sel.tcase {
-		throw("selectrecv: too many cases")
-	}
-	sel.ncase = i + 1
-	cas := (*scase)(add(unsafe.Pointer(&sel.scase), uintptr(i)*unsafe.Sizeof(sel.scase[0])))
-	cas.pc = pc
-	cas.c = c
-	cas.so = uint16(so)
-	cas.kind = caseRecv
-	cas.elem = elem
-	cas.receivedp = received
-
-	if debugSelect {
-		print("selectrecv s=", sel, " pc=", hex(cas.pc), " chan=", cas.c, " so=", cas.so, "\n")
-	}
-}
-
-//go:nosplit
-func selectdefault(sel *hselect) (selected bool) {
-	selectdefaultImpl(sel, getcallerpc(unsafe.Pointer(&sel)), uintptr(unsafe.Pointer(&selected))-uintptr(unsafe.Pointer(&sel)))
-	return
-}
-
-func selectdefaultImpl(sel *hselect, callerpc uintptr, so uintptr) {
-	i := sel.ncase
-	if i >= sel.tcase {
-		throw("selectdefault: too many cases")
-	}
-	sel.ncase = i + 1
-	cas := (*scase)(add(unsafe.Pointer(&sel.scase), uintptr(i)*unsafe.Sizeof(sel.scase[0])))
-	cas.pc = callerpc
-	cas.c = nil
-	cas.so = uint16(so)
-	cas.kind = caseDefault
-
-	if debugSelect {
-		print("selectdefault s=", sel, " pc=", hex(cas.pc), " so=", cas.so, "\n")
-	}
-}
-
-func sellock(sel *hselect) {
-	lockslice := slice{unsafe.Pointer(sel.lockorder), int(sel.ncase), int(sel.ncase)}
-	lockorder := *(*[]*hchan)(unsafe.Pointer(&lockslice))
+func sellock(scases []scase, lockorder []uint16) {
 	var c *hchan
-	for _, c0 := range lockorder {
-		if c0 != nil && c0 != c {
+	for _, o := range lockorder {
+		c0 := scases[o].c
+		if c0 != c {
 			c = c0
 			lock(&c.lock)
 		}
 	}
 }
 
-func selunlock(sel *hselect) {
+func selunlock(scases []scase, lockorder []uint16) {
 	// We must be very careful here to not touch sel after we have unlocked
 	// the last lock, because sel can be freed right after the last unlock.
 	// Consider the following situation.
@@ -179,92 +51,174 @@ func selunlock(sel *hselect) {
 	// the G that calls select runnable again and schedules it for execution.
 	// When the G runs on another M, it locks all the locks and frees sel.
 	// Now if the first M touches sel, it will access freed memory.
-	n := int(sel.ncase)
-	r := 0
-	lockslice := slice{unsafe.Pointer(sel.lockorder), n, n}
-	lockorder := *(*[]*hchan)(unsafe.Pointer(&lockslice))
-	// skip the default case
-	if n > 0 && lockorder[0] == nil {
-		r = 1
-	}
-	for i := n - 1; i >= r; i-- {
-		c := lockorder[i]
-		if i > 0 && c == lockorder[i-1] {
+	for i := len(lockorder) - 1; i >= 0; i-- {
+		c := scases[lockorder[i]].c
+		if i > 0 && c == scases[lockorder[i-1]].c {
 			continue // will unlock it on the next iteration
 		}
 		unlock(&c.lock)
 	}
 }
 
-func selparkcommit(gp *g, sel unsafe.Pointer) bool {
-	selunlock((*hselect)(sel))
+func selparkcommit(gp *g, _ unsafe.Pointer) bool {
+	// There are unlocked waitingGs that point into gp's stack. Stack
+	// copying must lock the channels of those waitingGs.
+	// Set activeStackChans here instead of before we try parking
+	// because we could self-deadlock in stack growth on a
+	// channel lock.
+	gp.activeStackChans = true
+	// Mark that it's safe for stack shrinking to occur now,
+	// because any thread acquiring this G's stack for shrinking
+	// is guaranteed to observe activeStackChans after this store.
+	gp.parkingOnChan.Store(false)
+	// Make sure we unlock after setting activeStackChans and
+	// unsetting parkingOnChan. The moment we unlock any of the
+	// channel locks we risk gp getting readied by a channel operation
+	// and so gp could continue running before everything before the
+	// unlock is visible (even to gp itself).
+
+	// This must not access gp's stack (see gopark). In
+	// particular, it must not access the *hselect. That's okay,
+	// because by the time this is called, gp.waiting has all
+	// channels in lock order.
+	var lastc *hchan
+	for wg := gp.waiting; wg != nil; wg = wg.waitlink {
+		if wg.c.get() != lastc && lastc != nil {
+			// As soon as we unlock the channel, fields in
+			// any waitingG with that channel may change,
+			// including c and waitlink. Since multiple
+			// waitingGs may have the same channel, we unlock
+			// only after we've passed the last instance
+			// of a channel.
+			unlock(&lastc.lock)
+		}
+		lastc = wg.c.get()
+	}
+	if lastc != nil {
+		unlock(&lastc.lock)
+	}
 	return true
 }
 
 func block() {
-	gopark(nil, nil, "select (no cases)", traceEvGoStop, 1) // forever
+	gopark(nil, nil, waitReasonSelectNoCases, traceBlockForever, 1) // forever
 }
 
-// overwrites return pc on stack to signal which case of the select
-// to run, so cannot appear at the top of a split stack.
-//go:nosplit
-func selectgo(sel *hselect) {
-	pc, offset := selectgoImpl(sel)
-	*(*bool)(add(unsafe.Pointer(&sel), uintptr(offset))) = true
-	setcallerpc(unsafe.Pointer(&sel), pc)
-}
-
-// selectgoImpl returns scase.pc and scase.so for the select
-// case which fired.
-func selectgoImpl(sel *hselect) (uintptr, uint16) {
+// selectgo implements the select statement.
+//
+// cas0 points to an array of type [ncases]scase, and order0 points to
+// an array of type [2*ncases]uint16 where ncases must be <= 65536.
+// Both reside on the goroutine's stack (regardless of any escaping in
+// selectgo).
+//
+// For race detector builds, pc0 points to an array of type
+// [ncases]uintptr (also on the stack); for other builds, it's set to
+// nil.
+//
+// selectgo returns the index of the chosen scase, which matches the
+// ordinal position of its respective select{recv,send,default} call.
+// Also, if the chosen scase was a receive operation, it reports whether
+// a value was received.
+func selectgo(cas0 *scase, order0 *uint16, pc0 *uintptr, nsends, nrecvs int, block bool) (int, bool) {
+	gp := getg()
 	if debugSelect {
-		print("select: sel=", sel, "\n")
+		print("select: cas0=", cas0, "\n")
 	}
 
-	scaseslice := slice{unsafe.Pointer(&sel.scase), int(sel.ncase), int(sel.ncase)}
-	scases := *(*[]scase)(unsafe.Pointer(&scaseslice))
+	// NOTE: In order to maintain a lean stack size, the number of scases
+	// is capped at 65536.
+	cas1 := (*[1 << 16]scase)(unsafe.Pointer(cas0))
+	order1 := (*[1 << 17]uint16)(unsafe.Pointer(order0))
+
+	ncases := nsends + nrecvs
+	scases := cas1[:ncases:ncases]
+	pollorder := order1[:ncases:ncases]
+	lockorder := order1[ncases:][:ncases:ncases]
+	// NOTE: pollorder/lockorder's underlying array was not zero-initialized by compiler.
+
+	// Even when raceenabled is true, there might be select
+	// statements in packages compiled without -race (e.g.,
+	// ensureSigM in runtime/signal_unix.go).
+	var pcs []uintptr
+	if raceenabled && pc0 != nil {
+		pc1 := (*[1 << 16]uintptr)(unsafe.Pointer(pc0))
+		pcs = pc1[:ncases:ncases]
+	}
+	casePC := func(casi int) uintptr {
+		if pcs == nil {
+			return 0
+		}
+		return pcs[casi]
+	}
 
 	var t0 int64
 	if blockprofilerate > 0 {
 		t0 = cputicks()
-		for i := 0; i < int(sel.ncase); i++ {
-			scases[i].releasetime = -1
-		}
 	}
 
 	// The compiler rewrites selects that statically have
 	// only 0 or 1 cases plus default into simpler constructs.
 	// The only way we can end up with such small sel.ncase
 	// values here is for a larger select in which most channels
-	// have been nilled out.  The general code handles those
+	// have been nilled out. The general code handles those
 	// cases correctly, and they are rare enough not to bother
 	// optimizing (and needing to test).
 
 	// generate permuted order
-	pollslice := slice{unsafe.Pointer(sel.pollorder), int(sel.ncase), int(sel.ncase)}
-	pollorder := *(*[]uint16)(unsafe.Pointer(&pollslice))
-	for i := 1; i < int(sel.ncase); i++ {
-		j := int(fastrand1()) % (i + 1)
-		pollorder[i] = pollorder[j]
+	norder := 0
+	allSynctest := true
+	for i := range scases {
+		cas := &scases[i]
+
+		// Omit cases without channels from the poll and lock orders.
+		if cas.c == nil {
+			cas.elem = nil // allow GC
+			continue
+		}
+
+		if cas.c.bubble != nil {
+			if getg().bubble != cas.c.bubble {
+				fatal("select on synctest channel from outside bubble")
+			}
+		} else {
+			allSynctest = false
+		}
+
+		if cas.c.timer != nil {
+			cas.c.timer.maybeRunChan(cas.c)
+		}
+
+		j := cheaprandn(uint32(norder + 1))
+		pollorder[norder] = pollorder[j]
 		pollorder[j] = uint16(i)
+		norder++
+	}
+	pollorder = pollorder[:norder]
+	lockorder = lockorder[:norder]
+
+	waitReason := waitReasonSelect
+	if gp.bubble != nil && allSynctest {
+		// Every channel selected on is in a synctest bubble,
+		// so this goroutine will count as idle while selecting.
+		waitReason = waitReasonSynctestSelect
 	}
 
 	// sort the cases by Hchan address to get the locking order.
 	// simple heap sort, to guarantee n log n time and constant stack footprint.
-	lockslice := slice{unsafe.Pointer(sel.lockorder), int(sel.ncase), int(sel.ncase)}
-	lockorder := *(*[]*hchan)(unsafe.Pointer(&lockslice))
-	for i := 0; i < int(sel.ncase); i++ {
+	for i := range lockorder {
 		j := i
-		c := scases[j].c
-		for j > 0 && lockorder[(j-1)/2].sortkey() < c.sortkey() {
+		// Start with the pollorder to permute cases on the same channel.
+		c := scases[pollorder[i]].c
+		for j > 0 && scases[lockorder[(j-1)/2]].c.sortkey() < c.sortkey() {
 			k := (j - 1) / 2
 			lockorder[j] = lockorder[k]
 			j = k
 		}
-		lockorder[j] = c
+		lockorder[j] = pollorder[i]
 	}
-	for i := int(sel.ncase) - 1; i >= 0; i-- {
-		c := lockorder[i]
+	for i := len(lockorder) - 1; i >= 0; i-- {
+		o := lockorder[i]
+		c := scases[o].c
 		lockorder[i] = lockorder[0]
 		j := 0
 		for {
@@ -272,237 +226,262 @@ func selectgoImpl(sel *hselect) (uintptr, uint16) {
 			if k >= i {
 				break
 			}
-			if k+1 < i && lockorder[k].sortkey() < lockorder[k+1].sortkey() {
+			if k+1 < i && scases[lockorder[k]].c.sortkey() < scases[lockorder[k+1]].c.sortkey() {
 				k++
 			}
-			if c.sortkey() < lockorder[k].sortkey() {
+			if c.sortkey() < scases[lockorder[k]].c.sortkey() {
 				lockorder[j] = lockorder[k]
 				j = k
 				continue
 			}
 			break
 		}
-		lockorder[j] = c
+		lockorder[j] = o
 	}
-	/*
-		for i := 0; i+1 < int(sel.ncase); i++ {
-			if lockorder[i].sortkey() > lockorder[i+1].sortkey() {
+
+	if debugSelect {
+		for i := 0; i+1 < len(lockorder); i++ {
+			if scases[lockorder[i]].c.sortkey() > scases[lockorder[i+1]].c.sortkey() {
 				print("i=", i, " x=", lockorder[i], " y=", lockorder[i+1], "\n")
 				throw("select: broken sort")
 			}
 		}
-	*/
+	}
 
 	// lock all the channels involved in the select
-	sellock(sel)
+	sellock(scases, lockorder)
 
 	var (
-		gp     *g
-		done   uint32
-		sg     *sudog
+		wg     *waitingG
 		c      *hchan
 		k      *scase
-		sglist *sudog
-		sgnext *sudog
-		futile byte
+		wglist *waitingG
+		wgnext *waitingG
+		qp     unsafe.Pointer
+		nextp  **waitingG
 	)
 
-loop:
 	// pass 1 - look for something already waiting
-	var dfl *scase
+	var casi int
 	var cas *scase
-	for i := 0; i < int(sel.ncase); i++ {
-		cas = &scases[pollorder[i]]
+	var caseSuccess bool
+	var caseReleaseTime int64 = -1
+	var recvOK bool
+	for _, casei := range pollorder {
+		casi = int(casei)
+		cas = &scases[casi]
 		c = cas.c
 
-		switch cas.kind {
-		case caseRecv:
-			if c.dataqsiz > 0 {
-				if c.qcount > 0 {
-					goto asyncrecv
-				}
-			} else {
-				sg = c.sendq.dequeue()
-				if sg != nil {
-					goto syncrecv
-				}
+		if casi >= nsends {
+			wg = c.sendq.dequeue()
+			if wg != nil {
+				goto recv
+			}
+			if c.qcount > 0 {
+				goto bufrecv
 			}
 			if c.closed != 0 {
 				goto rclose
 			}
-
-		case caseSend:
+		} else {
 			if raceenabled {
-				racereadpc(unsafe.Pointer(c), cas.pc, chansendpc)
+				racereadpc(c.raceaddr(), casePC(casi), chansendpc)
 			}
 			if c.closed != 0 {
 				goto sclose
 			}
-			if c.dataqsiz > 0 {
-				if c.qcount < c.dataqsiz {
-					goto asyncsend
-				}
-			} else {
-				sg = c.recvq.dequeue()
-				if sg != nil {
-					goto syncsend
-				}
+			wg = c.recvq.dequeue()
+			if wg != nil {
+				goto send
 			}
-
-		case caseDefault:
-			dfl = cas
+			if c.qcount < c.dataqsiz {
+				goto bufsend
+			}
 		}
 	}
 
-	if dfl != nil {
-		selunlock(sel)
-		cas = dfl
+	if !block {
+		selunlock(scases, lockorder)
+		casi = -1
 		goto retc
 	}
 
 	// pass 2 - enqueue on all chans
-	gp = getg()
-	done = 0
-	for i := 0; i < int(sel.ncase); i++ {
-		cas = &scases[pollorder[i]]
+	if gp.waiting != nil {
+		throw("gp.waiting != nil")
+	}
+	nextp = &gp.waiting
+	for _, casei := range lockorder {
+		casi = int(casei)
+		cas = &scases[casi]
 		c = cas.c
-		sg := acquireSudog()
-		sg.g = gp
-		// Note: selectdone is adjusted for stack copies in stack1.go:adjustsudogs
-		sg.selectdone = (*uint32)(noescape(unsafe.Pointer(&done)))
-		sg.elem = cas.elem
-		sg.releasetime = 0
+		wg := acquireWaitingG(waitingGTypeChan)
+		wg.g = gp
+		wg.isSelect = true
+		// No stack splits between assigning elem and enqueuing
+		// wg on gp.waiting where copystack can find it.
+		wg.elem.set(cas.elem)
+		wg.releasetime = 0
 		if t0 != 0 {
-			sg.releasetime = -1
+			wg.releasetime = -1
 		}
-		sg.waitlink = gp.waiting
-		gp.waiting = sg
+		wg.c.set(c)
+		// Construct waiting list in lock order.
+		*nextp = wg
+		nextp = &wg.waitlink
 
-		switch cas.kind {
-		case caseRecv:
-			c.recvq.enqueue(sg)
+		if casi < nsends {
+			c.sendq.enqueue(wg)
+		} else {
+			c.recvq.enqueue(wg)
+		}
 
-		case caseSend:
-			c.sendq.enqueue(sg)
+		if c.timer != nil {
+			blockTimerChan(c)
 		}
 	}
 
 	// wait for someone to wake us up
 	gp.param = nil
-	gopark(selparkcommit, unsafe.Pointer(sel), "select", traceEvGoBlockSelect|futile, 2)
+	// Signal to anyone trying to shrink our stack that we're about
+	// to park on a channel. The window between when this G's status
+	// changes and when we set gp.activeStackChans is not safe for
+	// stack shrinking.
+	gp.parkingOnChan.Store(true)
+	gopark(selparkcommit, nil, waitReason, traceBlockSelect, 1)
+	gp.activeStackChans = false
 
-	// someone woke us up
-	sellock(sel)
-	sg = (*sudog)(gp.param)
+	sellock(scases, lockorder)
+
+	gp.selectDone.Store(0)
+	wg = (*waitingG)(gp.param)
 	gp.param = nil
 
 	// pass 3 - dequeue from unsuccessful chans
 	// otherwise they stack up on quiet channels
 	// record the successful case, if any.
-	// We singly-linked up the SudoGs in case order, so when
-	// iterating through the linked list they are in reverse order.
+	// We singly-linked up the waitingGs in lock order.
+	casi = -1
 	cas = nil
-	sglist = gp.waiting
+	caseSuccess = false
+	wglist = gp.waiting
 	// Clear all elem before unlinking from gp.waiting.
-	for sg1 := gp.waiting; sg1 != nil; sg1 = sg1.waitlink {
-		sg1.selectdone = nil
-		sg1.elem = nil
+	for wg1 := gp.waiting; wg1 != nil; wg1 = wg1.waitlink {
+		wg1.isSelect = false
+		wg1.elem.set(nil)
+		wg1.c.set(nil)
 	}
 	gp.waiting = nil
-	for i := int(sel.ncase) - 1; i >= 0; i-- {
-		k = &scases[pollorder[i]]
-		if sglist.releasetime > 0 {
-			k.releasetime = sglist.releasetime
+
+	for _, casei := range lockorder {
+		k = &scases[casei]
+		if k.c.timer != nil {
+			unblockTimerChan(k.c)
 		}
-		if sg == sglist {
-			// sg has already been dequeued by the G that woke us up.
+		if wg == wglist {
+			// wg has already been dequeued by the G that woke us up.
+			casi = int(casei)
 			cas = k
+			caseSuccess = wglist.success
+			if wglist.releasetime > 0 {
+				caseReleaseTime = wglist.releasetime
+			}
 		} else {
 			c = k.c
-			if k.kind == caseSend {
-				c.sendq.dequeueSudoG(sglist)
+			if int(casei) < nsends {
+				c.sendq.dequeueWaitingG(wglist)
 			} else {
-				c.recvq.dequeueSudoG(sglist)
+				c.recvq.dequeueWaitingG(wglist)
 			}
 		}
-		sgnext = sglist.waitlink
-		sglist.waitlink = nil
-		releaseSudog(sglist)
-		sglist = sgnext
+		wgnext = wglist.waitlink
+		wglist.waitlink = nil
+		releaseWaitingG(wglist)
+		wglist = wgnext
 	}
 
 	if cas == nil {
-		futile = traceFutileWakeup
-		goto loop
+		throw("selectgo: bad wakeup")
 	}
 
 	c = cas.c
 
-	if c.dataqsiz > 0 {
-		throw("selectgo: shouldn't happen")
-	}
-
 	if debugSelect {
-		print("wait-return: sel=", sel, " c=", c, " cas=", cas, " kind=", cas.kind, "\n")
+		print("wait-return: cas0=", cas0, " c=", c, " cas=", cas, " send=", casi < nsends, "\n")
 	}
 
-	if cas.kind == caseRecv {
-		if cas.receivedp != nil {
-			*cas.receivedp = true
+	if casi < nsends {
+		if !caseSuccess {
+			goto sclose
 		}
+	} else {
+		recvOK = caseSuccess
 	}
 
 	if raceenabled {
-		if cas.kind == caseRecv && cas.elem != nil {
-			raceWriteObjectPC(c.elemtype, cas.elem, cas.pc, chanrecvpc)
-		} else if cas.kind == caseSend {
-			raceReadObjectPC(c.elemtype, cas.elem, cas.pc, chansendpc)
+		if casi < nsends {
+			raceReadObjectPC(c.elemtype, cas.elem, casePC(casi), chansendpc)
+		} else if cas.elem != nil {
+			raceWriteObjectPC(c.elemtype, cas.elem, casePC(casi), chanrecvpc)
+		}
+	}
+	if msanenabled {
+		if casi < nsends {
+			msanread(cas.elem, c.elemtype.Size_)
+		} else if cas.elem != nil {
+			msanwrite(cas.elem, c.elemtype.Size_)
+		}
+	}
+	if asanenabled {
+		if casi < nsends {
+			asanread(cas.elem, c.elemtype.Size_)
+		} else if cas.elem != nil {
+			asanwrite(cas.elem, c.elemtype.Size_)
 		}
 	}
 
-	selunlock(sel)
+	selunlock(scases, lockorder)
 	goto retc
 
-asyncrecv:
+bufrecv:
 	// can receive from buffer
 	if raceenabled {
 		if cas.elem != nil {
-			raceWriteObjectPC(c.elemtype, cas.elem, cas.pc, chanrecvpc)
+			raceWriteObjectPC(c.elemtype, cas.elem, casePC(casi), chanrecvpc)
 		}
-		raceacquire(chanbuf(c, c.recvx))
-		racerelease(chanbuf(c, c.recvx))
+		racenotify(c, c.recvx, nil)
 	}
-	if cas.receivedp != nil {
-		*cas.receivedp = true
+	if msanenabled && cas.elem != nil {
+		msanwrite(cas.elem, c.elemtype.Size_)
 	}
+	if asanenabled && cas.elem != nil {
+		asanwrite(cas.elem, c.elemtype.Size_)
+	}
+	recvOK = true
+	qp = chanbuf(c, c.recvx)
 	if cas.elem != nil {
-		typedmemmove(c.elemtype, cas.elem, chanbuf(c, c.recvx))
+		typedmemmove(c.elemtype, cas.elem, qp)
 	}
-	memclr(chanbuf(c, c.recvx), uintptr(c.elemsize))
+	typedmemclr(c.elemtype, qp)
 	c.recvx++
 	if c.recvx == c.dataqsiz {
 		c.recvx = 0
 	}
 	c.qcount--
-	sg = c.sendq.dequeue()
-	if sg != nil {
-		gp = sg.g
-		selunlock(sel)
-		if sg.releasetime != 0 {
-			sg.releasetime = cputicks()
-		}
-		goready(gp, 3)
-	} else {
-		selunlock(sel)
-	}
+	selunlock(scases, lockorder)
 	goto retc
 
-asyncsend:
+bufsend:
 	// can send to buffer
 	if raceenabled {
-		raceacquire(chanbuf(c, c.sendx))
-		racerelease(chanbuf(c, c.sendx))
-		raceReadObjectPC(c.elemtype, cas.elem, cas.pc, chansendpc)
+		racenotify(c, c.sendx, nil)
+		raceReadObjectPC(c.elemtype, cas.elem, casePC(casi), chansendpc)
+	}
+	if msanenabled {
+		msanread(cas.elem, c.elemtype.Size_)
+	}
+	if asanenabled {
+		asanread(cas.elem, c.elemtype.Size_)
 	}
 	typedmemmove(c.elemtype, chanbuf(c, c.sendx), cas.elem)
 	c.sendx++
@@ -510,96 +489,60 @@ asyncsend:
 		c.sendx = 0
 	}
 	c.qcount++
-	sg = c.recvq.dequeue()
-	if sg != nil {
-		gp = sg.g
-		selunlock(sel)
-		if sg.releasetime != 0 {
-			sg.releasetime = cputicks()
-		}
-		goready(gp, 3)
-	} else {
-		selunlock(sel)
-	}
+	selunlock(scases, lockorder)
 	goto retc
 
-syncrecv:
-	// can receive from sleeping sender (sg)
-	if raceenabled {
-		if cas.elem != nil {
-			raceWriteObjectPC(c.elemtype, cas.elem, cas.pc, chanrecvpc)
-		}
-		racesync(c, sg)
-	}
-	selunlock(sel)
+recv:
+	// can receive from sleeping sender (wg)
+	recv(c, wg, cas.elem, func() { selunlock(scases, lockorder) }, 2)
 	if debugSelect {
-		print("syncrecv: sel=", sel, " c=", c, "\n")
+		print("syncrecv: cas0=", cas0, " c=", c, "\n")
 	}
-	if cas.receivedp != nil {
-		*cas.receivedp = true
-	}
-	if cas.elem != nil {
-		typedmemmove(c.elemtype, cas.elem, sg.elem)
-	}
-	sg.elem = nil
-	gp = sg.g
-	gp.param = unsafe.Pointer(sg)
-	if sg.releasetime != 0 {
-		sg.releasetime = cputicks()
-	}
-	goready(gp, 3)
+	recvOK = true
 	goto retc
 
 rclose:
 	// read at end of closed channel
-	selunlock(sel)
-	if cas.receivedp != nil {
-		*cas.receivedp = false
-	}
+	selunlock(scases, lockorder)
+	recvOK = false
 	if cas.elem != nil {
-		memclr(cas.elem, uintptr(c.elemsize))
+		typedmemclr(c.elemtype, cas.elem)
 	}
 	if raceenabled {
-		raceacquire(unsafe.Pointer(c))
+		raceacquire(c.raceaddr())
 	}
 	goto retc
 
-syncsend:
-	// can send to sleeping receiver (sg)
+send:
+	// can send to a sleeping receiver (wg)
 	if raceenabled {
-		raceReadObjectPC(c.elemtype, cas.elem, cas.pc, chansendpc)
-		racesync(c, sg)
+		raceReadObjectPC(c.elemtype, cas.elem, casePC(casi), chansendpc)
 	}
-	selunlock(sel)
+	if msanenabled {
+		msanread(cas.elem, c.elemtype.Size_)
+	}
+	if asanenabled {
+		asanread(cas.elem, c.elemtype.Size_)
+	}
+	send(c, wg, cas.elem, func() { selunlock(scases, lockorder) }, 2)
 	if debugSelect {
-		print("syncsend: sel=", sel, " c=", c, "\n")
+		print("syncsend: cas0=", cas0, " c=", c, "\n")
 	}
-	if sg.elem != nil {
-		syncsend(c, sg, cas.elem)
-	}
-	sg.elem = nil
-	gp = sg.g
-	gp.param = unsafe.Pointer(sg)
-	if sg.releasetime != 0 {
-		sg.releasetime = cputicks()
-	}
-	goready(gp, 3)
+	goto retc
 
 retc:
-	if cas.releasetime > 0 {
-		blockevent(cas.releasetime-t0, 2)
+	if caseReleaseTime > 0 {
+		blockevent(caseReleaseTime-t0, 1)
 	}
-	return cas.pc, cas.so
+	return casi, recvOK
 
 sclose:
 	// send on closed channel
-	selunlock(sel)
-	panic("send on closed channel")
+	selunlock(scases, lockorder)
+	panic(plainError("send on closed channel"))
 }
 
 func (c *hchan) sortkey() uintptr {
-	// TODO(khr): if we have a moving garbage collector, we'll need to
-	// change this function.
 	return uintptr(unsafe.Pointer(c))
 }
 
@@ -623,65 +566,93 @@ const (
 )
 
 //go:linkname reflect_rselect reflect.rselect
-func reflect_rselect(cases []runtimeSelect) (chosen int, recvOK bool) {
-	// flagNoScan is safe here, because all objects are also referenced from cases.
-	size := selectsize(uintptr(len(cases)))
-	sel := (*hselect)(mallocgc(size, nil, flagNoScan))
-	newselect(sel, int64(size), int32(len(cases)))
-	r := new(bool)
-	for i := range cases {
-		rc := &cases[i]
+func reflect_rselect(cases []runtimeSelect) (int, bool) {
+	if len(cases) == 0 {
+		block()
+	}
+	sel := make([]scase, len(cases))
+	orig := make([]int, len(cases))
+	nsends, nrecvs := 0, 0
+	dflt := -1
+	for i, rc := range cases {
+		var j int
 		switch rc.dir {
 		case selectDefault:
-			selectdefaultImpl(sel, uintptr(i), 0)
+			dflt = i
+			continue
 		case selectSend:
-			if rc.ch == nil {
-				break
-			}
-			selectsendImpl(sel, rc.ch, uintptr(i), rc.val, 0)
+			j = nsends
+			nsends++
 		case selectRecv:
-			if rc.ch == nil {
-				break
-			}
-			selectrecvImpl(sel, rc.ch, uintptr(i), rc.val, r, 0)
+			nrecvs++
+			j = len(cases) - nrecvs
 		}
+
+		sel[j] = scase{c: rc.ch, elem: rc.val}
+		orig[j] = i
 	}
 
-	pc, _ := selectgoImpl(sel)
-	chosen = int(pc)
-	recvOK = *r
-	return
+	// Only a default case.
+	if nsends+nrecvs == 0 {
+		return dflt, false
+	}
+
+	// Compact sel and orig if necessary.
+	if nsends+nrecvs < len(cases) {
+		copy(sel[nsends:], sel[len(cases)-nrecvs:])
+		copy(orig[nsends:], orig[len(cases)-nrecvs:])
+	}
+
+	order := make([]uint16, 2*(nsends+nrecvs))
+	var pc0 *uintptr
+	if raceenabled {
+		pcs := make([]uintptr, nsends+nrecvs)
+		for i := range pcs {
+			selectsetpc(&pcs[i])
+		}
+		pc0 = &pcs[0]
+	}
+
+	chosen, recvOK := selectgo(&sel[0], &order[0], pc0, nsends, nrecvs, dflt == -1)
+
+	// Translate chosen back to caller's ordering.
+	if chosen < 0 {
+		chosen = dflt
+	} else {
+		chosen = orig[chosen]
+	}
+	return chosen, recvOK
 }
 
-func (q *waitq) dequeueSudoG(sgp *sudog) {
-	x := sgp.prev
-	y := sgp.next
+func (q *waitq) dequeueWaitingG(wg *waitingG) {
+	x := wg.prev
+	y := wg.next
 	if x != nil {
 		if y != nil {
 			// middle of queue
 			x.next = y
 			y.prev = x
-			sgp.next = nil
-			sgp.prev = nil
+			wg.next = nil
+			wg.prev = nil
 			return
 		}
 		// end of queue
 		x.next = nil
 		q.last = x
-		sgp.prev = nil
+		wg.prev = nil
 		return
 	}
 	if y != nil {
 		// start of queue
 		y.prev = nil
 		q.first = y
-		sgp.next = nil
+		wg.next = nil
 		return
 	}
 
-	// x==y==nil.  Either sgp is the only element in the queue,
-	// or it has already been removed.  Use q.first to disambiguate.
-	if q.first == sgp {
+	// x==y==nil. Either wg is the only element in the queue,
+	// or it has already been removed. Use q.first to disambiguate.
+	if q.first == wg {
 		q.first = nil
 		q.last = nil
 	}

@@ -6,6 +6,8 @@ package template
 
 import (
 	"fmt"
+	"slices"
+	"text/template/parse"
 )
 
 // context describes the state an HTML parser must be in when it reaches the
@@ -13,20 +15,30 @@ import (
 //
 // The zero value of type context is the start context for a template that
 // produces an HTML fragment as defined at
-// http://www.w3.org/TR/html5/syntax.html#the-end
+// https://www.w3.org/TR/html5/syntax.html#the-end
 // where the context element is null.
 type context struct {
 	state   state
 	delim   delim
 	urlPart urlPart
 	jsCtx   jsCtx
-	attr    attr
-	element element
-	err     *Error
+	// jsBraceDepth contains the current depth, for each JS template literal
+	// string interpolation expression, of braces we've seen. This is used to
+	// determine if the next } will close a JS template literal string
+	// interpolation expression or not.
+	jsBraceDepth []int
+	attr         attr
+	element      element
+	n            parse.Node // for range break/continue
+	err          *Error
 }
 
 func (c context) String() string {
-	return fmt.Sprintf("{%v %v %v %v %v %v %v}", c.state, c.delim, c.urlPart, c.jsCtx, c.attr, c.element, c.err)
+	var err error
+	if c.err != nil {
+		err = c.err
+	}
+	return fmt.Sprintf("{%v %v %v %v %v %v %v %v}", c.state, c.delim, c.urlPart, c.jsCtx, c.jsBraceDepth, c.attr, c.element, err)
 }
 
 // eq reports whether two contexts are equal.
@@ -35,6 +47,7 @@ func (c context) eq(d context) bool {
 		c.delim == d.delim &&
 		c.urlPart == d.urlPart &&
 		c.jsCtx == d.jsCtx &&
+		slices.Equal(c.jsBraceDepth, d.jsBraceDepth) &&
 		c.attr == d.attr &&
 		c.element == d.element &&
 		c.err == d.err
@@ -48,22 +61,32 @@ func (c context) mangle(templateName string) string {
 		return templateName
 	}
 	s := templateName + "$htmltemplate_" + c.state.String()
-	if c.delim != 0 {
+	if c.delim != delimNone {
 		s += "_" + c.delim.String()
 	}
-	if c.urlPart != 0 {
+	if c.urlPart != urlPartNone {
 		s += "_" + c.urlPart.String()
 	}
-	if c.jsCtx != 0 {
+	if c.jsCtx != jsCtxRegexp {
 		s += "_" + c.jsCtx.String()
 	}
-	if c.attr != 0 {
+	if c.jsBraceDepth != nil {
+		s += fmt.Sprintf("_jsBraceDepth(%v)", c.jsBraceDepth)
+	}
+	if c.attr != attrNone {
 		s += "_" + c.attr.String()
 	}
-	if c.element != 0 {
+	if c.element != elementNone {
 		s += "_" + c.element.String()
 	}
 	return s
+}
+
+// clone returns a copy of c with the same field values.
+func (c context) clone() context {
+	clone := c
+	clone.jsBraceDepth = slices.Clone(c.jsBraceDepth)
+	return clone
 }
 
 // state describes a high-level HTML parser state.
@@ -73,9 +96,13 @@ func (c context) mangle(templateName string) string {
 // HTML5 parsing algorithm because a single token production in the HTML
 // grammar may contain embedded actions in a template. For instance, the quoted
 // HTML attribute produced by
-//     <div title="Hello {{.World}}">
+//
+//	<div title="Hello {{.World}}">
+//
 // is a single token in HTML's grammar but in a template spans several nodes.
 type state uint8
+
+//go:generate stringer -type state
 
 const (
 	// stateText is parsed character data. An HTML parser is in
@@ -96,24 +123,32 @@ const (
 	// stateHTMLCmt occurs inside an <!-- HTML comment -->.
 	stateHTMLCmt
 	// stateRCDATA occurs inside an RCDATA element (<textarea> or <title>)
-	// as described at http://www.w3.org/TR/html5/syntax.html#elements-0
+	// as described at https://www.w3.org/TR/html5/syntax.html#elements-0
 	stateRCDATA
 	// stateAttr occurs inside an HTML attribute whose content is text.
 	stateAttr
 	// stateURL occurs inside an HTML attribute whose content is a URL.
 	stateURL
+	// stateSrcset occurs inside an HTML srcset attribute.
+	stateSrcset
 	// stateJS occurs inside an event handler or script element.
 	stateJS
 	// stateJSDqStr occurs inside a JavaScript double quoted string.
 	stateJSDqStr
 	// stateJSSqStr occurs inside a JavaScript single quoted string.
 	stateJSSqStr
+	// stateJSTmplLit occurs inside a JavaScript back quoted string.
+	stateJSTmplLit
 	// stateJSRegexp occurs inside a JavaScript regexp literal.
 	stateJSRegexp
 	// stateJSBlockCmt occurs inside a JavaScript /* block comment */.
 	stateJSBlockCmt
 	// stateJSLineCmt occurs inside a JavaScript // line comment.
 	stateJSLineCmt
+	// stateJSHTMLOpenCmt occurs inside a JavaScript <!-- HTML-like comment.
+	stateJSHTMLOpenCmt
+	// stateJSHTMLCloseCmt occurs inside a JavaScript --> HTML-like comment.
+	stateJSHTMLCloseCmt
 	// stateCSS occurs inside a <style> element or style attribute.
 	stateCSS
 	// stateCSSDqStr occurs inside a CSS double quoted string.
@@ -133,47 +168,19 @@ const (
 	// stateError is an infectious error state outside any valid
 	// HTML/CSS/JS construct.
 	stateError
+	// stateMetaContent occurs inside a HTML meta element content attribute.
+	stateMetaContent
+	// stateMetaContentURL occurs inside a "url=" tag in a HTML meta element content attribute.
+	stateMetaContentURL
+	// stateDead marks unreachable code after a {{break}} or {{continue}}.
+	stateDead
 )
-
-var stateNames = [...]string{
-	stateText:        "stateText",
-	stateTag:         "stateTag",
-	stateAttrName:    "stateAttrName",
-	stateAfterName:   "stateAfterName",
-	stateBeforeValue: "stateBeforeValue",
-	stateHTMLCmt:     "stateHTMLCmt",
-	stateRCDATA:      "stateRCDATA",
-	stateAttr:        "stateAttr",
-	stateURL:         "stateURL",
-	stateJS:          "stateJS",
-	stateJSDqStr:     "stateJSDqStr",
-	stateJSSqStr:     "stateJSSqStr",
-	stateJSRegexp:    "stateJSRegexp",
-	stateJSBlockCmt:  "stateJSBlockCmt",
-	stateJSLineCmt:   "stateJSLineCmt",
-	stateCSS:         "stateCSS",
-	stateCSSDqStr:    "stateCSSDqStr",
-	stateCSSSqStr:    "stateCSSSqStr",
-	stateCSSDqURL:    "stateCSSDqURL",
-	stateCSSSqURL:    "stateCSSSqURL",
-	stateCSSURL:      "stateCSSURL",
-	stateCSSBlockCmt: "stateCSSBlockCmt",
-	stateCSSLineCmt:  "stateCSSLineCmt",
-	stateError:       "stateError",
-}
-
-func (s state) String() string {
-	if int(s) < len(stateNames) {
-		return stateNames[s]
-	}
-	return fmt.Sprintf("illegal state %d", int(s))
-}
 
 // isComment is true for any state that contains content meant for template
 // authors & maintainers, not for end-users or machines.
 func isComment(s state) bool {
 	switch s {
-	case stateHTMLCmt, stateJSBlockCmt, stateJSLineCmt, stateCSSBlockCmt, stateCSSLineCmt:
+	case stateHTMLCmt, stateJSBlockCmt, stateJSLineCmt, stateJSHTMLOpenCmt, stateJSHTMLCloseCmt, stateCSSBlockCmt, stateCSSLineCmt:
 		return true
 	}
 	return false
@@ -188,8 +195,24 @@ func isInTag(s state) bool {
 	return false
 }
 
+// isInScriptLiteral returns true if s is one of the literal states within a
+// <script> tag, and as such occurrences of "<!--", "<script", and "</script"
+// need to be treated specially.
+func isInScriptLiteral(s state) bool {
+	// Ignore the comment states (stateJSBlockCmt, stateJSLineCmt,
+	// stateJSHTMLOpenCmt, stateJSHTMLCloseCmt) because their content is already
+	// omitted from the output.
+	switch s {
+	case stateJSDqStr, stateJSSqStr, stateJSTmplLit, stateJSRegexp:
+		return true
+	}
+	return false
+}
+
 // delim is the delimiter that will end the current HTML attribute.
 type delim uint8
+
+//go:generate stringer -type delim
 
 const (
 	// delimNone occurs outside any attribute.
@@ -203,23 +226,11 @@ const (
 	delimSpaceOrTagEnd
 )
 
-var delimNames = [...]string{
-	delimNone:          "delimNone",
-	delimDoubleQuote:   "delimDoubleQuote",
-	delimSingleQuote:   "delimSingleQuote",
-	delimSpaceOrTagEnd: "delimSpaceOrTagEnd",
-}
-
-func (d delim) String() string {
-	if int(d) < len(delimNames) {
-		return delimNames[d]
-	}
-	return fmt.Sprintf("illegal delim %d", int(d))
-}
-
 // urlPart identifies a part in an RFC 3986 hierarchical URL to allow different
 // encoding strategies.
 type urlPart uint8
+
+//go:generate stringer -type urlPart
 
 const (
 	// urlPartNone occurs when not in a URL, or possibly at the start:
@@ -236,23 +247,11 @@ const (
 	urlPartUnknown
 )
 
-var urlPartNames = [...]string{
-	urlPartNone:        "urlPartNone",
-	urlPartPreQuery:    "urlPartPreQuery",
-	urlPartQueryOrFrag: "urlPartQueryOrFrag",
-	urlPartUnknown:     "urlPartUnknown",
-}
-
-func (u urlPart) String() string {
-	if int(u) < len(urlPartNames) {
-		return urlPartNames[u]
-	}
-	return fmt.Sprintf("illegal urlPart %d", int(u))
-}
-
 // jsCtx determines whether a '/' starts a regular expression literal or a
 // division operator.
 type jsCtx uint8
+
+//go:generate stringer -type jsCtx
 
 const (
 	// jsCtxRegexp occurs where a '/' would start a regexp literal.
@@ -263,18 +262,6 @@ const (
 	jsCtxUnknown
 )
 
-func (c jsCtx) String() string {
-	switch c {
-	case jsCtxRegexp:
-		return "jsCtxRegexp"
-	case jsCtxDivOp:
-		return "jsCtxDivOp"
-	case jsCtxUnknown:
-		return "jsCtxUnknown"
-	}
-	return fmt.Sprintf("illegal jsCtx %d", int(c))
-}
-
 // element identifies the HTML element when inside a start tag or special body.
 // Certain HTML element (for example <script> and <style>) have bodies that are
 // treated differently from stateText so the element type is necessary to
@@ -282,10 +269,13 @@ func (c jsCtx) String() string {
 // end delimiter for the body.
 type element uint8
 
+//go:generate stringer -type element
+
 const (
 	// elementNone occurs outside a special tag or special element body.
 	elementNone element = iota
-	// elementScript corresponds to the raw text <script> element.
+	// elementScript corresponds to the raw text <script> element
+	// with JS MIME type or no type attribute.
 	elementScript
 	// elementStyle corresponds to the raw text <style> element.
 	elementStyle
@@ -293,22 +283,11 @@ const (
 	elementTextarea
 	// elementTitle corresponds to the RCDATA <title> element.
 	elementTitle
+	// elementMeta corresponds to the HTML <meta> element.
+	elementMeta
 )
 
-var elementNames = [...]string{
-	elementNone:     "elementNone",
-	elementScript:   "elementScript",
-	elementStyle:    "elementStyle",
-	elementTextarea: "elementTextarea",
-	elementTitle:    "elementTitle",
-}
-
-func (e element) String() string {
-	if int(e) < len(elementNames) {
-		return elementNames[e]
-	}
-	return fmt.Sprintf("illegal element %d", int(e))
-}
+//go:generate stringer -type attr
 
 // attr identifies the current HTML attribute when inside the attribute,
 // that is, starting from stateAttrName until stateTag/stateText (exclusive).
@@ -319,22 +298,14 @@ const (
 	attrNone attr = iota
 	// attrScript corresponds to an event handler attribute.
 	attrScript
+	// attrScriptType corresponds to the type attribute in script HTML element
+	attrScriptType
 	// attrStyle corresponds to the style attribute whose value is CSS.
 	attrStyle
 	// attrURL corresponds to an attribute whose value is a URL.
 	attrURL
+	// attrSrcset corresponds to a srcset attribute.
+	attrSrcset
+	// attrMetaContent corresponds to the content attribute in meta HTML element.
+	attrMetaContent
 )
-
-var attrNames = [...]string{
-	attrNone:   "attrNone",
-	attrScript: "attrScript",
-	attrStyle:  "attrStyle",
-	attrURL:    "attrURL",
-}
-
-func (a attr) String() string {
-	if int(a) < len(attrNames) {
-		return attrNames[a]
-	}
-	return fmt.Sprintf("illegal attr %d", int(a))
-}

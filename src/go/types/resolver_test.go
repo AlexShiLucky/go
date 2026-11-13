@@ -7,27 +7,33 @@ package types_test
 import (
 	"fmt"
 	"go/ast"
-	"go/importer"
-	"go/parser"
 	"go/token"
 	"internal/testenv"
-	"sort"
+	"slices"
 	"testing"
 
 	. "go/types"
 )
 
 type resolveTestImporter struct {
-	importer Importer
+	fset     *token.FileSet
+	importer ImporterFrom
 	imported map[string]bool
 }
 
-func (imp *resolveTestImporter) Import(path string) (*Package, error) {
+func (imp *resolveTestImporter) Import(string) (*Package, error) {
+	panic("should not be called")
+}
+
+func (imp *resolveTestImporter) ImportFrom(path, srcDir string, mode ImportMode) (*Package, error) {
+	if mode != 0 {
+		panic("mode must be 0")
+	}
 	if imp.importer == nil {
-		imp.importer = importer.Default()
+		imp.importer = defaultImporter(testFSet).(ImporterFrom)
 		imp.imported = make(map[string]bool)
 	}
-	pkg, err := imp.importer.Import(path)
+	pkg, err := imp.importer.ImportFrom(path, srcDir, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -113,16 +119,12 @@ func TestResolveIdents(t *testing.T) {
 	// parse package files
 	fset := token.NewFileSet()
 	var files []*ast.File
-	for i, src := range sources {
-		f, err := parser.ParseFile(fset, fmt.Sprintf("sources[%d]", i), src, parser.DeclarationErrors)
-		if err != nil {
-			t.Fatal(err)
-		}
-		files = append(files, f)
+	for _, src := range sources {
+		files = append(files, mustParse(fset, src))
 	}
 
 	// resolve and type-check package AST
-	importer := new(resolveTestImporter)
+	importer := &resolveTestImporter{fset: fset}
 	conf := Config{Importer: importer}
 	uses := make(map[*ast.Ident]Object)
 	defs := make(map[*ast.Ident]Object)
@@ -154,7 +156,7 @@ func TestResolveIdents(t *testing.T) {
 					}
 					return false
 				}
-				return false
+				return true
 			}
 			return true
 		})
@@ -192,7 +194,7 @@ func TestResolveIdents(t *testing.T) {
 	}
 
 	// check the expected set of idents that are simultaneously uses and defs
-	sort.Strings(both)
+	slices.Sort(both)
 	if got, want := fmt.Sprint(both), "[Mutex Stringer error]"; got != want {
 		t.Errorf("simultaneous uses/defs = %s, want %s", got, want)
 	}

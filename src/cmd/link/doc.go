@@ -3,11 +3,11 @@
 // license that can be found in the LICENSE file.
 
 /*
-Link, typically invoked as ``go tool link,'' reads the Go archive or object
+Link, typically invoked as “go tool link”, reads the Go archive or object
 for a package main, along with its dependencies, and combines them
 into an executable binary.
 
-Command Line
+# Command Line
 
 Usage:
 
@@ -18,8 +18,8 @@ Flags:
 	-B note
 		Add an ELF_NT_GNU_BUILD_ID note when using ELF.
 		The value should start with 0x and be an even number of hex digits.
-	-D address
-		Set data segment address.
+		Alternatively, you can pass "gobuildid" in order to derive the
+		GNU build ID from the Go build ID.
 	-E entry
 		Set entry symbol name.
 	-H type
@@ -34,35 +34,73 @@ Flags:
 	-R quantum
 		Set address rounding quantum.
 	-T address
-		Set text segment address.
+		Set the start address of text symbols.
 	-V
-		Print the linker version and exit.
+		Print linker version and exit.
 	-X importpath.name=value
 		Set the value of the string variable in importpath named name to value.
+		This is only effective if the variable is declared in the source code either uninitialized
+		or initialized to a constant string expression. -X will not work if the initializer makes
+		a function call or refers to other variables.
 		Note that before Go 1.5 this option took two separate arguments.
-		Now it takes one argument split on the first = sign.
+	-asan
+		Link with C/C++ address sanitizer support.
+	-aslr
+		Enable ASLR for buildmode=c-shared on windows (default true).
+	-bindnow
+		Mark a dynamically linked ELF object for immediate function binding (default false).
+	-buildid id
+		Record id as Go toolchain build id.
 	-buildmode mode
 		Set build mode (default exe).
+	-c
+		Dump call graphs.
+	-checklinkname=value
+		If value is 0, all go:linkname directives are permitted.
+		If value is 1 (the default), only a known set of widely-used
+		linknames are permitted.
+	-compressdwarf
+		Compress DWARF if possible (default true).
 	-cpuprofile file
 		Write CPU profile to file.
 	-d
-		Disable generation of dynamic executables.
+		Disable generation of dynamic executables (ELF only).
 		The emitted code is the same in either case; the option
 		controls only whether a dynamic header is included.
 		The dynamic header is on by default, even without any
 		references to dynamic libraries, because many common
 		system tools now assume the presence of the header.
+	-dumpdep
+		Dump symbol dependency graph.
+	-e
+		No limit on number of errors reported.
+	-extar ar
+		Set the external archive program (default "ar").
+		Used only for -buildmode=c-archive.
 	-extld linker
 		Set the external linker (default "clang" or "gcc").
 	-extldflags flags
 		Set space-separated flags to pass to the external linker.
 	-f
 		Ignore version mismatch in the linked archives.
+	-funcalign N
+		Set function alignment to N bytes
 	-g
 		Disable Go package data checks.
+	-importcfg file
+		Read import configuration from file.
+		In the file, set packagefile, packageshlib to specify import resolution.
 	-installsuffix suffix
 		Look for packages in $GOROOT/pkg/$GOOS_$GOARCH_suffix
 		instead of $GOROOT/pkg/$GOOS_$GOARCH.
+	-k symbol
+		Set field tracking symbol. Use this flag when GOEXPERIMENT=fieldtrack is set.
+	-libgcc file
+		Set name of compiler support library.
+		This is only used in internal link mode.
+		If not set, default value comes from running the compiler,
+		which may be set by the -extld option.
+		Set to "none" to use no support library.
 	-linkmode mode
 		Set link mode (internal, external, auto).
 		This sets the linking mode as described in cmd/cgo/doc.go.
@@ -72,16 +110,19 @@ Flags:
 		Write memory profile to file.
 	-memprofilerate rate
 		Set runtime.MemProfileRate to rate.
+	-msan
+		Link with C/C++ memory sanitizer support.
 	-o file
 		Write output to file (default a.out, or a.out.exe on Windows).
+	-pluginpath path
+		The path name used to prefix exported plugin symbols.
 	-r dir1:dir2:...
 		Set the ELF dynamic linker search path.
 	-race
 		Link with race detection libraries.
 	-s
 		Omit the symbol table and debug information.
-	-shared
-		Generated shared object (implies -linkmode external; experimental).
+		Implies the -w flag, which can be negated with -w=0.
 	-tmpdir dir
 		Write temporary files to dir.
 		Temporary files are only used in external linking mode.

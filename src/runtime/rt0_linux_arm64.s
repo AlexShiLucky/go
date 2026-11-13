@@ -4,16 +4,10 @@
 
 #include "textflag.h"
 
-TEXT _rt0_arm64_linux(SB),NOSPLIT,$-8
-	MOVD	0(RSP), R0	// argc
-	ADD	$8, RSP, R1	// argv
-	BL	main(SB)
+TEXT _rt0_arm64_linux(SB),NOSPLIT,$0
+	JMP	_rt0_arm64(SB)
 
-TEXT main(SB),NOSPLIT,$-8
-	MOVD	$runtime·rt0_go(SB), R2
-	BL	(R2)
-exit:
-	MOVD $0, R0
-	MOVD	$94, R8	// sys_exit
-	SVC
-	B	exit
+// When building with -buildmode=c-shared, this symbol is called when the shared
+// library is loaded.
+TEXT _rt0_arm64_linux_lib(SB),NOSPLIT,$0
+	JMP	_rt0_arm64_lib(SB)

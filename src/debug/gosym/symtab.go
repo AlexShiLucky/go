@@ -1,4 +1,4 @@
-// Copyright 2009 The Go Authors.  All rights reserved.
+// Copyright 2009 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -6,11 +6,6 @@
 // and line number tables embedded in Go binaries generated
 // by the gc compilers.
 package gosym
-
-// The table format is a variant of the format used in Plan 9's a.out
-// format, documented at http://plan9.bell-labs.com/magic/man2html/6/a.out.
-// The best reference for the differences between the Plan 9 format
-// and the Go format is the runtime source, specifically ../../runtime/symtab.c.
 
 import (
 	"bytes"
@@ -32,34 +27,97 @@ type Sym struct {
 	GoType uint64
 	// If this symbol is a function symbol, the corresponding Func
 	Func *Func
+
+	goVersion version
 }
 
 // Static reports whether this symbol is static (not visible outside its file).
 func (s *Sym) Static() bool { return s.Type >= 'a' }
 
+// nameWithoutInst returns s.Name with all bracketed expressions masked by
+// underscores. This is useful to ignore any extra slashes or dots inside the
+// brackets from the string searches below, while preserving the byte indices
+// of the characters outside the brackets.
+//
+// s.Name is returned as-is if the brackets are imbalanced.
+func (s *Sym) nameWithoutInst() string {
+	n := 0
+	b := []byte(s.Name)
+	for i, r := range b {
+		switch r {
+		case '[':
+			n++
+		case ']':
+			n--
+			if n < 0 {
+				return s.Name // malformed
+			}
+		default:
+			if n > 0 {
+				b[i] = '_'
+			}
+		}
+	}
+	if n > 0 {
+		return s.Name // malformed
+	}
+	return string(b)
+}
+
 // PackageName returns the package part of the symbol name,
 // or the empty string if there is none.
 func (s *Sym) PackageName() string {
-	if i := strings.Index(s.Name, "."); i != -1 {
-		return s.Name[0:i]
+	name := s.nameWithoutInst()
+
+	// Since go1.20, a prefix of "type:" and "go:" is a compiler-generated symbol,
+	// they do not belong to any package.
+	//
+	// See cmd/compile/internal/base/link.go:ReservedImports variable.
+	if s.goVersion >= ver120 && (strings.HasPrefix(name, "go:") || strings.HasPrefix(name, "type:")) {
+		return ""
+	}
+
+	// For go1.18 and below, the prefix are "type." and "go." instead.
+	if s.goVersion <= ver118 && (strings.HasPrefix(name, "go.") || strings.HasPrefix(name, "type.")) {
+		return ""
+	}
+
+	pathend := strings.LastIndex(name, "/")
+	if pathend < 0 {
+		pathend = 0
+	}
+
+	if i := strings.Index(name[pathend:], "."); i != -1 {
+		return s.Name[:pathend+i]
 	}
 	return ""
 }
 
 // ReceiverName returns the receiver type name of this symbol,
-// or the empty string if there is none.
+// or the empty string if there is none.  A receiver name is only detected in
+// the case that s.Name is fully-specified with a package name.
 func (s *Sym) ReceiverName() string {
-	l := strings.Index(s.Name, ".")
-	r := strings.LastIndex(s.Name, ".")
+	name := s.nameWithoutInst()
+	pathend := strings.LastIndex(name, "/")
+	if pathend < 0 {
+		pathend = 0
+	}
+	// Find the first dot after pathend (or from the beginning, if there was
+	// no slash in name).
+	l := strings.Index(name[pathend:], ".")
+	// Find the last dot after pathend (or the beginning).
+	r := strings.LastIndex(name[pathend:], ".")
 	if l == -1 || r == -1 || l == r {
+		// There is no receiver if we didn't find two distinct dots after pathend.
 		return ""
 	}
-	return s.Name[l+1 : r]
+	return s.Name[pathend+l+1 : pathend+r]
 }
 
 // BaseName returns the symbol name without the package or receiver name.
 func (s *Sym) BaseName() string {
-	if i := strings.LastIndex(s.Name, "."); i != -1 {
+	name := s.nameWithoutInst()
+	if i := strings.LastIndex(name, "."); i != -1 {
 		return s.Name[i+1:]
 	}
 	return s.Name
@@ -70,8 +128,8 @@ type Func struct {
 	Entry uint64
 	*Sym
 	End       uint64
-	Params    []*Sym
-	Locals    []*Sym
+	Params    []*Sym // nil for Go 1.3 and later binaries
+	Locals    []*Sym // nil for Go 1.3 and later binaries
 	FrameSize int
 	LineTable *LineTable
 	Obj       *Obj
@@ -103,14 +161,14 @@ type Obj struct {
  * Symbol tables
  */
 
-// Table represents a Go symbol table.  It stores all of the
+// Table represents a Go symbol table. It stores all of the
 // symbols decoded from the program and provides methods to translate
 // between symbols, names, and addresses.
 type Table struct {
-	Syms  []Sym
+	Syms  []Sym // nil for Go 1.3 and later binaries
 	Funcs []Func
-	Files map[string]*Obj // nil for Go 1.2 and later binaries
-	Objs  []Obj           // nil for Go 1.2 and later binaries
+	Files map[string]*Obj // for Go 1.2 and later all files map to one Obj
+	Objs  []Obj           // for Go 1.2 and later only one Obj in slice
 
 	go12line *LineTable // Go 1.2 line number table
 }
@@ -268,8 +326,10 @@ func walksymtab(data []byte, fn func(sym) error) error {
 	return nil
 }
 
-// NewTable decodes the Go symbol table in data,
+// NewTable decodes the Go symbol table (the ".gosymtab" section in ELF),
 // returning an in-memory representation.
+// Starting with Go 1.3, the Go symbol table no longer includes symbol data;
+// callers should pass nil for the symtab parameter.
 func NewTable(symtab []byte, pcln *LineTable) (*Table, error) {
 	var n int
 	err := walksymtab(symtab, func(s sym) error {
@@ -294,8 +354,9 @@ func NewTable(symtab []byte, pcln *LineTable) (*Table, error) {
 		t.Syms = t.Syms[0 : n+1]
 		ts := &t.Syms[n]
 		ts.Type = s.typ
-		ts.Value = uint64(s.value)
-		ts.GoType = uint64(s.gotype)
+		ts.Value = s.value
+		ts.GoType = s.gotype
+		ts.goVersion = pcln.version
 		switch s.typ {
 		default:
 			// rewrite name to use . instead of · (c2 b7)
@@ -353,7 +414,7 @@ func NewTable(symtab []byte, pcln *LineTable) (*Table, error) {
 	}
 
 	// Count text symbols and attach frame sizes, parameters, and
-	// locals to them.  Also, find object file boundaries.
+	// locals to them. Also, find object file boundaries.
 	lastf := 0
 	for i := 0; i < len(t.Syms); i++ {
 		sym := &t.Syms[i]
@@ -503,7 +564,7 @@ func (t *Table) PCToLine(pc uint64) (file string, line int, fn *Func) {
 }
 
 // LineToPC looks up the first program counter on the given line in
-// the named file.  It returns UnknownPathError or UnknownLineError if
+// the named file. It returns [UnknownFileError] or [UnknownLineError] if
 // there is an error looking up this line.
 func (t *Table) LineToPC(file string, line int) (pc uint64, fn *Func, err error) {
 	obj, ok := t.Files[file]
@@ -697,7 +758,7 @@ func (e *UnknownLineError) Error() string {
 type DecodingError struct {
 	off int
 	msg string
-	val interface{}
+	val any
 }
 
 func (e *DecodingError) Error() string {

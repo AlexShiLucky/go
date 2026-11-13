@@ -5,6 +5,7 @@
 package net
 
 import (
+	"internal/testenv"
 	"os"
 	"runtime"
 	"strings"
@@ -14,46 +15,40 @@ import (
 // testableNetwork reports whether network is testable on the current
 // platform configuration.
 func testableNetwork(network string) bool {
-	ss := strings.Split(network, ":")
-	switch ss[0] {
+	net, _, _ := strings.Cut(network, ":")
+	switch net {
 	case "ip+nopriv":
-		switch runtime.GOOS {
-		case "nacl":
-			return false
-		}
 	case "ip", "ip4", "ip6":
 		switch runtime.GOOS {
-		case "nacl", "plan9":
+		case "plan9":
 			return false
 		default:
 			if os.Getuid() != 0 {
 				return false
 			}
 		}
-	case "unix", "unixgram":
+	case "unixgram":
 		switch runtime.GOOS {
-		case "nacl", "plan9", "windows":
+		case "windows":
 			return false
+		default:
+			return supportsUnixSocket()
 		}
-		// iOS does not support unix, unixgram.
-		if runtime.GOOS == "darwin" && (runtime.GOARCH == "arm" || runtime.GOARCH == "arm64") {
-			return false
-		}
+	case "unix":
+		return supportsUnixSocket()
 	case "unixpacket":
 		switch runtime.GOOS {
-		case "android", "darwin", "nacl", "plan9", "windows":
-			fallthrough
-		case "freebsd": // FreeBSD 8 and below don't support unixpacket
+		case "aix", "android", "darwin", "ios", "plan9", "windows":
 			return false
 		}
 	}
-	switch ss[0] {
+	switch net {
 	case "tcp4", "udp4", "ip4":
-		if !supportsIPv4 {
+		if !supportsIPv4() {
 			return false
 		}
 	case "tcp6", "udp6", "ip6":
-		if !supportsIPv6 {
+		if !supportsIPv6() {
 			return false
 		}
 	}
@@ -63,7 +58,7 @@ func testableNetwork(network string) bool {
 // testableAddress reports whether address of network is testable on
 // the current platform configuration.
 func testableAddress(network, address string) bool {
-	switch ss := strings.Split(network, ":"); ss[0] {
+	switch net, _, _ := strings.Cut(network, ":"); net {
 	case "unix", "unixgram", "unixpacket":
 		// Abstract unix domain sockets, a Linux-ism.
 		if address[0] == '@' && runtime.GOOS != "linux" {
@@ -82,7 +77,7 @@ func testableListenArgs(network, address, client string) bool {
 
 	var err error
 	var addr Addr
-	switch ss := strings.Split(network, ":"); ss[0] {
+	switch net, _, _ := strings.Cut(network, ":"); net {
 	case "tcp", "tcp4", "tcp6":
 		addr, err = ResolveTCPAddr("tcp", address)
 	case "udp", "udp4", "udp6":
@@ -110,31 +105,31 @@ func testableListenArgs(network, address, client string) bool {
 	}
 
 	// Test wildcard IP addresses.
-	if wildcard && (testing.Short() || !*testExternal) {
+	if wildcard && !testenv.HasExternalNetwork() {
 		return false
 	}
 
 	// Test functionality of IPv4 communication using AF_INET and
 	// IPv6 communication using AF_INET6 sockets.
-	if !supportsIPv4 && ip.To4() != nil {
+	if !supportsIPv4() && ip.To4() != nil {
 		return false
 	}
-	if !supportsIPv6 && ip.To16() != nil && ip.To4() == nil {
+	if !supportsIPv6() && ip.To16() != nil && ip.To4() == nil {
 		return false
 	}
 	cip := ParseIP(client)
 	if cip != nil {
-		if !supportsIPv4 && cip.To4() != nil {
+		if !supportsIPv4() && cip.To4() != nil {
 			return false
 		}
-		if !supportsIPv6 && cip.To16() != nil && cip.To4() == nil {
+		if !supportsIPv6() && cip.To16() != nil && cip.To4() == nil {
 			return false
 		}
 	}
 
 	// Test functionality of IPv4 communication using AF_INET6
 	// sockets.
-	if !supportsIPv4map && supportsIPv4 && (network == "tcp" || network == "udp" || network == "ip") && wildcard {
+	if !supportsIPv4map() && supportsIPv4() && (network == "tcp" || network == "udp" || network == "ip") && wildcard {
 		// At this point, we prefer IPv4 when ip is nil.
 		// See favoriteAddrFamily for further information.
 		if ip.To16() != nil && ip.To4() == nil && cip.To4() != nil { // a pair of IPv6 server and IPv4 client
@@ -148,12 +143,19 @@ func testableListenArgs(network, address, client string) bool {
 	return true
 }
 
-var condFatalf = func() func(*testing.T, string, ...interface{}) {
-	// A few APIs, File, Read/WriteMsg{UDP,IP}, are not
-	// implemented yet on both Plan 9 and Windows.
+func condFatalf(t *testing.T, network string, format string, args ...any) {
+	t.Helper()
+	// A few APIs like File and Read/WriteMsg{UDP,IP} are not
+	// fully implemented yet on Plan 9 and Windows.
 	switch runtime.GOOS {
-	case "plan9", "windows":
-		return (*testing.T).Logf
+	case "windows", "js", "wasip1":
+		if network == "file+net" {
+			t.Logf(format, args...)
+			return
+		}
+	case "plan9":
+		t.Logf(format, args...)
+		return
 	}
-	return (*testing.T).Fatalf
-}()
+	t.Fatalf(format, args...)
+}

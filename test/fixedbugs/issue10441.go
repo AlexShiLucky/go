@@ -1,4 +1,4 @@
-// build
+// compile
 
 // Copyright 2015 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
@@ -11,7 +11,7 @@ func bar() {
 	foo(&f)
 }
 
+//go:noinline
 func foo(f *func()) func() {
-	defer func() {}() // prevent inlining of foo
 	return *f
 }

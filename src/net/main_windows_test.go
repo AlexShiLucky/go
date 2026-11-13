@@ -4,33 +4,54 @@
 
 package net
 
+import (
+	"internal/poll"
+	"os/exec"
+	"syscall"
+)
+
 var (
 	// Placeholders for saving original socket system calls.
-	origSocket      = socketFunc
-	origClosesocket = closeFunc
+	origWSASocket   = wsaSocketFunc
+	origClosesocket = poll.CloseFunc
 	origConnect     = connectFunc
-	origConnectEx   = connectExFunc
+	origConnectEx   = poll.ConnectExFunc
 	origListen      = listenFunc
+	origAccept      = poll.AcceptFunc
 )
 
 func installTestHooks() {
-	socketFunc = sw.Socket
-	closeFunc = sw.Closesocket
+	wsaSocketFunc = sw.WSASocket
+	poll.CloseFunc = sw.Closesocket
 	connectFunc = sw.Connect
-	connectExFunc = sw.ConnectEx
+	poll.ConnectExFunc = sw.ConnectEx
 	listenFunc = sw.Listen
+	poll.AcceptFunc = sw.AcceptEx
 }
 
 func uninstallTestHooks() {
-	socketFunc = origSocket
-	closeFunc = origClosesocket
+	wsaSocketFunc = origWSASocket
+	poll.CloseFunc = origClosesocket
 	connectFunc = origConnect
-	connectExFunc = origConnectEx
+	poll.ConnectExFunc = origConnectEx
 	listenFunc = origListen
+	poll.AcceptFunc = origAccept
 }
 
+// forceCloseSockets must be called only from TestMain.
 func forceCloseSockets() {
 	for s := range sw.Sockets() {
-		closeFunc(s)
+		poll.CloseFunc(s)
 	}
+}
+
+func addCmdInheritedHandle(cmd *exec.Cmd, fd uintptr) {
+	// Inherited handles are not inherited by default in Windows.
+	// We need to set the handle inheritance flag explicitly.
+	// See https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessa#parameters
+	// for more details.
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.AdditionalInheritedHandles = append(cmd.SysProcAttr.AdditionalInheritedHandles, syscall.Handle(fd))
 }

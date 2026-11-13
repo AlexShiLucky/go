@@ -6,6 +6,7 @@ package net
 
 import (
 	"reflect"
+	"runtime"
 	"testing"
 )
 
@@ -205,23 +206,23 @@ var addrListTests = []struct {
 		nil,
 	},
 
-	{nil, nil, testInetaddr, nil, nil, nil, errNoSuitableAddress},
+	{nil, nil, testInetaddr, nil, nil, nil, &AddrError{errNoSuitableAddress.Error(), "ADDR"}},
 
-	{ipv4only, nil, testInetaddr, nil, nil, nil, errNoSuitableAddress},
-	{ipv4only, []IPAddr{{IP: IPv6loopback}}, testInetaddr, nil, nil, nil, errNoSuitableAddress},
+	{ipv4only, nil, testInetaddr, nil, nil, nil, &AddrError{errNoSuitableAddress.Error(), "ADDR"}},
+	{ipv4only, []IPAddr{{IP: IPv6loopback}}, testInetaddr, nil, nil, nil, &AddrError{errNoSuitableAddress.Error(), "ADDR"}},
 
-	{ipv6only, nil, testInetaddr, nil, nil, nil, errNoSuitableAddress},
-	{ipv6only, []IPAddr{{IP: IPv4(127, 0, 0, 1)}}, testInetaddr, nil, nil, nil, errNoSuitableAddress},
+	{ipv6only, nil, testInetaddr, nil, nil, nil, &AddrError{errNoSuitableAddress.Error(), "ADDR"}},
+	{ipv6only, []IPAddr{{IP: IPv4(127, 0, 0, 1)}}, testInetaddr, nil, nil, nil, &AddrError{errNoSuitableAddress.Error(), "ADDR"}},
 }
 
 func TestAddrList(t *testing.T) {
-	if !supportsIPv4 || !supportsIPv6 {
+	if !supportsIPv4() || !supportsIPv6() {
 		t.Skip("both IPv4 and IPv6 are required")
 	}
 
 	for i, tt := range addrListTests {
-		addrs, err := filterAddrList(tt.filter, tt.ips, tt.inetaddr)
-		if err != tt.err {
+		addrs, err := filterAddrList(tt.filter, tt.ips, tt.inetaddr, "ADDR")
+		if !reflect.DeepEqual(err, tt.err) {
 			t.Errorf("#%v: got %v; want %v", i, err, tt.err)
 		}
 		if tt.err != nil {
@@ -278,5 +279,28 @@ func TestAddrListPartition(t *testing.T) {
 				t.Errorf("#%v: got %v; want %v", i, fallbacks, tt.fallbacks)
 			}
 		}
+	}
+}
+
+func TestListenIPv6WildcardAddr(t *testing.T) {
+	if runtime.GOOS == "js" || runtime.GOOS == "wasip1" {
+		t.Skip("fake networking does not implement [::] wildcard address assertions")
+	}
+	if !supportsIPv6() {
+		t.Skip("IPv6 not supported")
+	}
+	if !supportsIPv4map() {
+		t.Skip("dual-stack IPv6 sockets not supported")
+	}
+
+	ln, err := Listen("tcp", "[::]:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	addr := ln.Addr().(*TCPAddr)
+	if addr.IP.To4() != nil {
+		t.Errorf("Listen(\"tcp\", \"[::]:0\") bound to %v, want IPv6 address", addr)
 	}
 }

@@ -7,16 +7,25 @@
 package types
 
 import (
-	"bytes"
+	"cmp"
 	"fmt"
+	"slices"
 	"sort"
+	"strings"
 )
 
 // A MethodSet is an ordered set of concrete or abstract (interface) methods;
-// a method is a MethodVal selection, and they are ordered by ascending m.Obj().Id().
+// a method is a [MethodVal] selection, and they are ordered by ascending m.Obj().Id().
 // The zero value for a MethodSet is a ready-to-use empty method set.
 type MethodSet struct {
-	list []*Selection
+	list []methodSetEntry
+}
+
+// A methodSetEntry is a method of a MethodSet, along with its Id,
+// so that sorting and searching need not recompute it.
+type methodSetEntry struct {
+	id  string // = sel.Obj().Id()
+	sel *Selection
 }
 
 func (s *MethodSet) String() string {
@@ -24,10 +33,10 @@ func (s *MethodSet) String() string {
 		return "MethodSet {}"
 	}
 
-	var buf bytes.Buffer
+	var buf strings.Builder
 	fmt.Fprintln(&buf, "MethodSet {")
-	for _, f := range s.list {
-		fmt.Fprintf(&buf, "\t%s\n", f)
+	for _, e := range s.list {
+		fmt.Fprintf(&buf, "\t%s\n", e.sel)
 	}
 	fmt.Fprintln(&buf, "}")
 	return buf.String()
@@ -37,7 +46,7 @@ func (s *MethodSet) String() string {
 func (s *MethodSet) Len() int { return len(s.list) }
 
 // At returns the i'th method in s for 0 <= i < s.Len().
-func (s *MethodSet) At(i int) *Selection { return s.list[i] }
+func (s *MethodSet) At(i int) *Selection { return s.list[i].sel }
 
 // Lookup returns the method with matching package and name, or nil if not found.
 func (s *MethodSet) Lookup(pkg *Package, name string) *Selection {
@@ -45,22 +54,45 @@ func (s *MethodSet) Lookup(pkg *Package, name string) *Selection {
 		return nil
 	}
 
-	key := Id(pkg, name)
+	// Search for Id(pkg, name) without constructing it,
+	// as it must allocate for unexported names.
+	path := idPath(pkg, name)
 	i := sort.Search(len(s.list), func(i int) bool {
-		m := s.list[i]
-		return m.obj.Id() >= key
+		return compareId(s.list[i].id, path, name) >= 0
 	})
-	if i < len(s.list) {
-		m := s.list[i]
-		if m.obj.Id() == key {
-			return m
-		}
+	if i < len(s.list) && compareId(s.list[i].id, path, name) == 0 {
+		return s.list[i].sel
 	}
 	return nil
 }
 
+// compareId returns strings.Compare(id, key) without allocating, where
+// key is path + "." + name if path is non-empty, or name otherwise.
+func compareId(id, path, name string) int {
+	if path == "" {
+		return strings.Compare(id, name)
+	}
+	n := min(len(id), len(path))
+	if c := strings.Compare(id[:n], path[:n]); c != 0 {
+		return c
+	}
+	if len(id) == n {
+		return -1 // id is a prefix of path, and so of key
+	}
+	// id has the prefix path.
+	if id[n] != '.' {
+		return cmp.Compare(id[n], '.')
+	}
+	return strings.Compare(id[n+1:], name)
+}
+
 // Shared empty method set.
 var emptyMethodSet MethodSet
+
+// Note: NewMethodSet is intended for external use only as it
+//       requires interfaces to be complete. It may be used
+//       internally if LookupFieldOrMethod completed the same
+//       interfaces beforehand.
 
 // NewMethodSet returns the method set for the given type T.
 // It always returns a non-nil method set, even if it is empty.
@@ -68,44 +100,52 @@ func NewMethodSet(T Type) *MethodSet {
 	// WARNING: The code in this function is extremely subtle - do not modify casually!
 	//          This function and lookupFieldOrMethod should be kept in sync.
 
+	// TODO(rfindley) confirm that this code is in sync with lookupFieldOrMethod
+	//                with respect to type params.
+
+	// Methods cannot be associated with a named pointer type.
+	// (spec: "The type denoted by T is called the receiver base type;
+	// it must not be a pointer or interface type and it must be declared
+	// in the same package as the method.").
+	if t := asNamed(T); t != nil && isPointer(t) {
+		return &emptyMethodSet
+	}
+
 	// method set up to the current depth, allocated lazily
 	var base methodSet
 
 	typ, isPtr := deref(T)
-	named, _ := typ.(*Named)
 
 	// *typ where typ is an interface has no methods.
-	if isPtr {
-		utyp := typ
-		if named != nil {
-			utyp = named.underlying
-		}
-		if _, ok := utyp.(*Interface); ok {
-			return &emptyMethodSet
-		}
+	if isPtr && IsInterface(typ) {
+		return &emptyMethodSet
 	}
 
 	// Start with typ as single entry at shallowest depth.
-	// If typ is not a named type, insert a nil type instead.
-	current := []embeddedType{{named, nil, isPtr, false}}
+	current := []embeddedType{{typ, nil, isPtr, false}}
 
-	// named types that we have seen already, allocated lazily
-	var seen map[*Named]bool
+	// seen tracks named types that we have seen already, allocated lazily.
+	// Used to avoid endless searches in case of recursive types.
+	//
+	// We must use a lookup on identity rather than a simple map[*Named]bool as
+	// instantiated types may be identical but not equal.
+	var seen instanceLookup
 
 	// collect methods at current depth
 	for len(current) > 0 {
 		var next []embeddedType // embedded types found at current depth
 
-		// field and method sets at current depth, allocated lazily
-		var fset fieldSet
+		// field and method sets at current depth, indexed by names (Id's), and allocated lazily
+		var fset map[string]bool // we only care about the field names
 		var mset methodSet
 
 		for _, e := range current {
-			// The very first time only, e.typ may be nil.
-			// In this case, we don't have a named type and
-			// we simply continue with the underlying type.
-			if e.typ != nil {
-				if seen[e.typ] {
+			typ := e.typ
+
+			// If we have a named type, we may have associated methods.
+			// Look for those first.
+			if named := asNamed(typ); named != nil {
+				if alt := seen.lookup(named); alt != nil {
 					// We have seen this type before, at a more shallow depth
 					// (note that multiples of this type at the current depth
 					// were consolidated before). The type at that depth shadows
@@ -113,38 +153,36 @@ func NewMethodSet(T Type) *MethodSet {
 					// this one.
 					continue
 				}
-				if seen == nil {
-					seen = make(map[*Named]bool)
+				seen.add(named)
+
+				for i := 0; i < named.NumMethods(); i++ {
+					mset = mset.addOne(named.Method(i), concat(e.index, i), e.indirect, e.multiples)
 				}
-				seen[e.typ] = true
-
-				mset = mset.add(e.typ.methods, e.index, e.indirect, e.multiples)
-
-				// continue with underlying type
-				typ = e.typ.underlying
 			}
 
-			switch t := typ.(type) {
+			switch t := typ.Underlying().(type) {
 			case *Struct:
 				for i, f := range t.fields {
-					fset = fset.add(f, e.multiples)
+					if fset == nil {
+						fset = make(map[string]bool)
+					}
+					fset[f.Id()] = true
 
 					// Embedded fields are always of the form T or *T where
-					// T is a named type. If typ appeared multiple times at
+					// T is a type name. If typ appeared multiple times at
 					// this depth, f.Type appears multiple times at the next
 					// depth.
-					if f.anonymous {
-						// Ignore embedded basic types - only user-defined
-						// named types can have methods or struct fields.
+					if f.embedded {
 						typ, isPtr := deref(f.typ)
-						if t, _ := typ.(*Named); t != nil {
-							next = append(next, embeddedType{t, concat(e.index, i), e.indirect || isPtr, e.multiples})
-						}
+						// TODO(gri) optimization: ignore types that can't
+						// have fields or methods (only Named, Struct, and
+						// Interface types need to be considered).
+						next = append(next, embeddedType{typ, concat(e.index, i), e.indirect || isPtr, e.multiples})
 					}
 				}
 
 			case *Interface:
-				mset = mset.add(t.allMethods, e.index, true, e.multiples)
+				mset = mset.add(t.typeSet().methods, e.index, true, e.multiples)
 			}
 		}
 
@@ -153,7 +191,7 @@ func NewMethodSet(T Type) *MethodSet {
 		for k, m := range mset {
 			if _, found := base[k]; !found {
 				// Fields collide with methods of the same name at this depth.
-				if _, found := fset[k]; found {
+				if fset[k] {
 					m = nil // collision
 				}
 				if base == nil {
@@ -163,17 +201,14 @@ func NewMethodSet(T Type) *MethodSet {
 			}
 		}
 
-		// Multiple fields with matching names collide at this depth and shadow all
-		// entries further down; add them as collisions to base if no entries with
-		// matching names exist already.
-		for k, f := range fset {
-			if f == nil {
-				if _, found := base[k]; !found {
-					if base == nil {
-						base = make(methodSet)
-					}
-					base[k] = nil // collision
+		// Add all (remaining) fields at this depth as collisions (since they will
+		// hide any method further down) if no entries with matching names exist already.
+		for k := range fset {
+			if _, found := base[k]; !found {
+				if base == nil {
+					base = make(methodSet)
 				}
+				base[k] = nil // collision
 			}
 		}
 
@@ -184,45 +219,23 @@ func NewMethodSet(T Type) *MethodSet {
 		return &emptyMethodSet
 	}
 
-	// collect methods
-	var list []*Selection
-	for _, m := range base {
+	// collect methods, sorted by unique name
+	var list []methodSetEntry
+	for id, m := range base {
 		if m != nil {
 			m.recv = T
-			list = append(list, m)
+			list = append(list, methodSetEntry{id, m})
 		}
 	}
-	sort.Sort(byUniqueName(list))
+	slices.SortFunc(list, func(x, y methodSetEntry) int {
+		return strings.Compare(x.id, y.id)
+	})
 	return &MethodSet{list}
-}
-
-// A fieldSet is a set of fields and name collisions.
-// A collision indicates that multiple fields with the
-// same unique id appeared.
-type fieldSet map[string]*Var // a nil entry indicates a name collision
-
-// Add adds field f to the field set s.
-// If multiples is set, f appears multiple times
-// and is treated as a collision.
-func (s fieldSet) add(f *Var, multiples bool) fieldSet {
-	if s == nil {
-		s = make(fieldSet)
-	}
-	key := f.Id()
-	// if f is not in the set, add it
-	if !multiples {
-		if _, found := s[key]; !found {
-			s[key] = f
-			return s
-		}
-	}
-	s[key] = nil // collision
-	return s
 }
 
 // A methodSet is a set of methods and name collisions.
 // A collision indicates that multiple methods with the
-// same unique id appeared.
+// same unique id, or a field with that id appeared.
 type methodSet map[string]*Selection // a nil entry indicates a name collision
 
 // Add adds all functions in list to the method set s.
@@ -232,37 +245,28 @@ func (s methodSet) add(list []*Func, index []int, indirect bool, multiples bool)
 	if len(list) == 0 {
 		return s
 	}
-	if s == nil {
-		s = make(methodSet)
-	}
 	for i, f := range list {
-		key := f.Id()
-		// if f is not in the set, add it
-		if !multiples {
-			// TODO(gri) A found method may not be added because it's not in the method set
-			// (!indirect && ptrRecv(f)). A 2nd method on the same level may be in the method
-			// set and may not collide with the first one, thus leading to a false positive.
-			// Is that possible? Investigate.
-			if _, found := s[key]; !found && (indirect || !ptrRecv(f)) {
-				s[key] = &Selection{MethodVal, nil, f, concat(index, i), indirect}
-				continue
-			}
-		}
-		s[key] = nil // collision
+		s = s.addOne(f, concat(index, i), indirect, multiples)
 	}
 	return s
 }
 
-// ptrRecv reports whether the receiver is of the form *T.
-// The receiver must exist.
-func ptrRecv(f *Func) bool {
-	_, isPtr := deref(f.typ.(*Signature).recv.typ)
-	return isPtr
+func (s methodSet) addOne(f *Func, index []int, indirect bool, multiples bool) methodSet {
+	if s == nil {
+		s = make(methodSet)
+	}
+	key := f.Id()
+	// if f is not in the set, add it
+	if !multiples {
+		// TODO(gri) A found method may not be added because it's not in the method set
+		// (!indirect && f.hasPtrRecv()). A 2nd method on the same level may be in the method
+		// set and may not collide with the first one, thus leading to a false positive.
+		// Is that possible? Investigate.
+		if _, found := s[key]; !found && (indirect || !f.hasPtrRecv()) {
+			s[key] = &Selection{int8(MethodVal), indirect, nil, f, index}
+			return s
+		}
+	}
+	s[key] = nil // collision
+	return s
 }
-
-// byUniqueName function lists can be sorted by their unique names.
-type byUniqueName []*Selection
-
-func (a byUniqueName) Len() int           { return len(a) }
-func (a byUniqueName) Less(i, j int) bool { return a[i].obj.Id() < a[j].obj.Id() }
-func (a byUniqueName) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }

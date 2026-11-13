@@ -7,8 +7,9 @@ package runtime
 func checkgoarm() {
 	// TODO(minux): FP checks like in os_linux_arm.go.
 
-	// osinit not called yet, so ncpu not set: must use getncpu directly.
-	if getncpu() > 1 && goarm < 7 {
+	// osinit not called yet, so numCPUStartup not set: must use
+	// getCPUCount directly.
+	if getCPUCount() > 1 && goarm < 7 {
 		print("runtime: this system has multiple CPUs and must use\n")
 		print("atomic synchronization instructions. Recompile using GOARM=7.\n")
 		exit(1)
@@ -17,8 +18,6 @@ func checkgoarm() {
 
 //go:nosplit
 func cputicks() int64 {
-	// Currently cputicks() is used in blocking profiler and to seed runtime·fastrand1().
 	// runtime·nanotime() is a poor approximation of CPU ticks that is enough for the profiler.
-	// TODO: need more entropy to better seed fastrand1.
 	return nanotime()
 }

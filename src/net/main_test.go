@@ -10,10 +10,11 @@ import (
 	"net/internal/socktest"
 	"os"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 var (
@@ -24,9 +25,9 @@ var (
 )
 
 var (
-	testDNSFlood = flag.Bool("dnsflood", false, "whether to test DNS query flooding")
+	testTCPBig = flag.Bool("tcpbig", false, "whether to test massive size of data per read or write call on TCP connection")
 
-	testExternal = flag.Bool("external", true, "allow use of external networks during long test")
+	testDNSFlood = flag.Bool("dnsflood", false, "whether to test DNS query flooding")
 
 	// If external IPv4 connectivity exists, we can try dialing
 	// non-node/interface local scope IPv4 addresses.
@@ -59,6 +60,20 @@ func TestMain(m *testing.M) {
 	os.Exit(st)
 }
 
+// mustSetDeadline calls the bound method m to set a deadline on a Conn.
+// If the call fails, mustSetDeadline skips t if the current GOOS is believed
+// not to support deadlines, or fails the test otherwise.
+func mustSetDeadline(t testing.TB, m func(time.Time) error, d time.Duration) {
+	err := m(time.Now().Add(d))
+	if err != nil {
+		t.Helper()
+		if runtime.GOOS == "plan9" {
+			t.Skipf("skipping: %s does not support deadlines", runtime.GOOS)
+		}
+		t.Fatal(err)
+	}
+}
+
 type ipv6LinkLocalUnicastTest struct {
 	network, address string
 	nameLookup       bool
@@ -70,7 +85,7 @@ var (
 )
 
 func setupTestData() {
-	if supportsIPv4 {
+	if supportsIPv4() {
 		resolveTCPAddrTests = append(resolveTCPAddrTests, []resolveTCPAddrTest{
 			{"tcp", "localhost:1", &TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 1}, nil},
 			{"tcp4", "localhost:2", &TCPAddr{IP: IPv4(127, 0, 0, 1), Port: 2}, nil},
@@ -85,25 +100,31 @@ func setupTestData() {
 		}...)
 	}
 
-	if supportsIPv6 {
+	if supportsIPv6() {
 		resolveTCPAddrTests = append(resolveTCPAddrTests, resolveTCPAddrTest{"tcp6", "localhost:3", &TCPAddr{IP: IPv6loopback, Port: 3}, nil})
 		resolveUDPAddrTests = append(resolveUDPAddrTests, resolveUDPAddrTest{"udp6", "localhost:3", &UDPAddr{IP: IPv6loopback, Port: 3}, nil})
 		resolveIPAddrTests = append(resolveIPAddrTests, resolveIPAddrTest{"ip6", "localhost", &IPAddr{IP: IPv6loopback}, nil})
+
+		// Issue 20911: don't return IPv4 addresses for
+		// Resolve*Addr calls of the IPv6 unspecified address.
+		resolveTCPAddrTests = append(resolveTCPAddrTests, resolveTCPAddrTest{"tcp", "[::]:4", &TCPAddr{IP: IPv6unspecified, Port: 4}, nil})
+		resolveUDPAddrTests = append(resolveUDPAddrTests, resolveUDPAddrTest{"udp", "[::]:4", &UDPAddr{IP: IPv6unspecified, Port: 4}, nil})
+		resolveIPAddrTests = append(resolveIPAddrTests, resolveIPAddrTest{"ip", "::", &IPAddr{IP: IPv6unspecified}, nil})
 	}
 
 	ifi := loopbackInterface()
 	if ifi != nil {
 		index := fmt.Sprintf("%v", ifi.Index)
 		resolveTCPAddrTests = append(resolveTCPAddrTests, []resolveTCPAddrTest{
-			{"tcp6", "[fe80::1%" + ifi.Name + "]:1", &TCPAddr{IP: ParseIP("fe80::1"), Port: 1, Zone: zoneToString(ifi.Index)}, nil},
+			{"tcp6", "[fe80::1%" + ifi.Name + "]:1", &TCPAddr{IP: ParseIP("fe80::1"), Port: 1, Zone: zoneCache.name(ifi.Index)}, nil},
 			{"tcp6", "[fe80::1%" + index + "]:2", &TCPAddr{IP: ParseIP("fe80::1"), Port: 2, Zone: index}, nil},
 		}...)
 		resolveUDPAddrTests = append(resolveUDPAddrTests, []resolveUDPAddrTest{
-			{"udp6", "[fe80::1%" + ifi.Name + "]:1", &UDPAddr{IP: ParseIP("fe80::1"), Port: 1, Zone: zoneToString(ifi.Index)}, nil},
+			{"udp6", "[fe80::1%" + ifi.Name + "]:1", &UDPAddr{IP: ParseIP("fe80::1"), Port: 1, Zone: zoneCache.name(ifi.Index)}, nil},
 			{"udp6", "[fe80::1%" + index + "]:2", &UDPAddr{IP: ParseIP("fe80::1"), Port: 2, Zone: index}, nil},
 		}...)
 		resolveIPAddrTests = append(resolveIPAddrTests, []resolveIPAddrTest{
-			{"ip6", "fe80::1%" + ifi.Name, &IPAddr{IP: ParseIP("fe80::1"), Zone: zoneToString(ifi.Index)}, nil},
+			{"ip6", "fe80::1%" + ifi.Name, &IPAddr{IP: ParseIP("fe80::1"), Zone: zoneCache.name(ifi.Index)}, nil},
 			{"ip6", "fe80::1%" + index, &IPAddr{IP: ParseIP("fe80::1"), Zone: index}, nil},
 		}...)
 	}
@@ -125,7 +146,7 @@ func setupTestData() {
 			{"udp6", "[" + addr + "%" + ifi.Name + "]:0", false},
 		}...)
 		switch runtime.GOOS {
-		case "darwin", "dragonfly", "freebsd", "openbsd", "netbsd":
+		case "darwin", "ios", "dragonfly", "freebsd", "openbsd", "netbsd":
 			ipv6LinkLocalUnicastTCPTests = append(ipv6LinkLocalUnicastTCPTests, []ipv6LinkLocalUnicastTest{
 				{"tcp", "[localhost%" + ifi.Name + "]:0", true},
 				{"tcp6", "[localhost%" + ifi.Name + "]:0", true},
@@ -164,18 +185,15 @@ func runningGoroutines() []string {
 	var gss []string
 	b := make([]byte, 2<<20)
 	b = b[:runtime.Stack(b, true)]
-	for _, s := range strings.Split(string(b), "\n\n") {
-		ss := strings.SplitN(s, "\n", 2)
-		if len(ss) != 2 {
-			continue
-		}
-		stack := strings.TrimSpace(ss[1])
+	for s := range strings.SplitSeq(string(b), "\n\n") {
+		_, stack, _ := strings.Cut(s, "\n")
+		stack = strings.TrimSpace(stack)
 		if !strings.Contains(stack, "created by net") {
 			continue
 		}
 		gss = append(gss, stack)
 	}
-	sort.Strings(gss)
+	slices.Sort(gss)
 	return gss
 }
 

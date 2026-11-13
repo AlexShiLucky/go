@@ -6,6 +6,7 @@ package gccgoimporter
 
 import (
 	"bufio"
+	"fmt"
 	"go/types"
 	"os"
 	"os/exec"
@@ -26,8 +27,10 @@ type GccgoInstallation struct {
 }
 
 // Ask the driver at the given path for information for this GccgoInstallation.
-func (inst *GccgoInstallation) InitFromDriver(gccgoPath string) (err error) {
-	cmd := exec.Command(gccgoPath, "-###", "-S", "-x", "go", "-")
+// The given arguments are passed directly to the call of the driver.
+func (inst *GccgoInstallation) InitFromDriver(gccgoPath string, args ...string) (err error) {
+	argv := append([]string{"-###", "-S", "-x", "go", "-"}, args...)
+	cmd := exec.Command(gccgoPath, argv...)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return
@@ -54,8 +57,12 @@ func (inst *GccgoInstallation) InitFromDriver(gccgoPath string) (err error) {
 			}
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("failed to parse target triple from gccgo stderr: %v", err)
+	}
 
-	stdout, err := exec.Command(gccgoPath, "-dumpversion").Output()
+	argv = append([]string{"-dumpversion"}, args...)
+	stdout, err := exec.Command(gccgoPath, argv...).Output()
 	if err != nil {
 		return
 	}

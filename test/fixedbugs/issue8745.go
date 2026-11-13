@@ -1,6 +1,6 @@
 // errorcheck
 
-// Copyright 2015 The Go Authors.  All rights reserved.
+// Copyright 2015 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -9,5 +9,5 @@
 package p
 
 func f(s string) {
-	var _ float64 = s[2] // ERROR "cannot use.*type byte.*as type float64"
+	var _ float64 = s[2] // ERROR "cannot use.*type byte.*as type float64|cannot use .* as float64 value"
 }

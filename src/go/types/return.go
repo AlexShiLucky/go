@@ -17,7 +17,7 @@ import (
 func (check *Checker) isTerminating(s ast.Stmt, label string) bool {
 	switch s := s.(type) {
 	default:
-		unreachable()
+		panic("unreachable")
 
 	case *ast.BadStmt, *ast.DeclStmt, *ast.EmptyStmt, *ast.SendStmt,
 		*ast.IncDecStmt, *ast.AssignStmt, *ast.GoStmt, *ast.DeferStmt,
@@ -28,15 +28,9 @@ func (check *Checker) isTerminating(s ast.Stmt, label string) bool {
 		return check.isTerminating(s.Stmt, s.Label.Name)
 
 	case *ast.ExprStmt:
-		// the predeclared (possibly parenthesized) panic() function is terminating
-		if call, _ := unparen(s.X).(*ast.CallExpr); call != nil {
-			if id, _ := call.Fun.(*ast.Ident); id != nil {
-				if _, obj := check.scope.LookupParent(id.Name, token.NoPos); obj != nil {
-					if b, _ := obj.(*Builtin); b != nil && b.id == _Panic {
-						return true
-					}
-				}
-			}
+		// calling the predeclared (possibly parenthesized) panic() function is terminating
+		if call, ok := ast.Unparen(s.X).(*ast.CallExpr); ok && check.isPanic[call] {
+			return true
 		}
 
 	case *ast.ReturnStmt:
@@ -83,8 +77,13 @@ func (check *Checker) isTerminating(s ast.Stmt, label string) bool {
 }
 
 func (check *Checker) isTerminatingList(list []ast.Stmt, label string) bool {
-	n := len(list)
-	return n > 0 && check.isTerminating(list[n-1], label)
+	// trailing empty statements are permitted - skip them
+	for i := len(list) - 1; i >= 0; i-- {
+		if _, ok := list[i].(*ast.EmptyStmt); !ok {
+			return check.isTerminating(list[i], label)
+		}
+	}
+	return false // all statements are empty
 }
 
 func (check *Checker) isTerminatingSwitch(body *ast.BlockStmt, label string) bool {
@@ -102,8 +101,8 @@ func (check *Checker) isTerminatingSwitch(body *ast.BlockStmt, label string) boo
 }
 
 // TODO(gri) For nested breakable statements, the current implementation of hasBreak
-//	     will traverse the same subtree repeatedly, once for each label. Replace
-//           with a single-pass label/break matching phase.
+// will traverse the same subtree repeatedly, once for each label. Replace
+// with a single-pass label/break matching phase.
 
 // hasBreak reports if s is or contains a break statement
 // referring to the label-ed statement or implicit-ly the
@@ -111,7 +110,7 @@ func (check *Checker) isTerminatingSwitch(body *ast.BlockStmt, label string) boo
 func hasBreak(s ast.Stmt, label string, implicit bool) bool {
 	switch s := s.(type) {
 	default:
-		unreachable()
+		panic("unreachable")
 
 	case *ast.BadStmt, *ast.DeclStmt, *ast.EmptyStmt, *ast.ExprStmt,
 		*ast.SendStmt, *ast.IncDecStmt, *ast.AssignStmt, *ast.GoStmt,

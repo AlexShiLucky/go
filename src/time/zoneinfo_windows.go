@@ -7,11 +7,10 @@ package time
 import (
 	"errors"
 	"internal/syscall/windows/registry"
-	"runtime"
 	"syscall"
 )
 
-//go:generate go run genzabbrs.go -output zoneinfo_abbrs_windows.go
+var platformZoneSources []string // none: Windows uses system calls instead
 
 // TODO(rsc): Fall back to copy of zoneinfo files.
 
@@ -21,8 +20,8 @@ import (
 // time apply to all previous and future years as well.
 
 // matchZoneKey checks if stdname and dstname match the corresponding key
-// values "MUI_Std" and MUI_Dlt" or "Std" and "Dlt" (the latter down-level
-// from Vista) in the kname key stored under the open registry key zones.
+// values "MUI_Std" and "MUI_Dlt" or "Std" and "Dlt" in the kname key stored
+// under the open registry key zones.
 func matchZoneKey(zones registry.Key, kname string, stdname, dstname string) (matched bool, err2 error) {
 	k, err := registry.OpenKey(zones, kname, registry.READ)
 	if err != nil {
@@ -31,12 +30,10 @@ func matchZoneKey(zones registry.Key, kname string, stdname, dstname string) (ma
 	defer k.Close()
 
 	var std, dlt string
-	if err = registry.LoadRegLoadMUIString(); err == nil {
-		// Try MUI_Std and MUI_Dlt first, fallback to Std and Dlt if *any* error occurs
-		std, err = k.GetMUIStringValue("MUI_Std")
-		if err == nil {
-			dlt, err = k.GetMUIStringValue("MUI_Dlt")
-		}
+	// Try MUI_Std and MUI_Dlt first, fallback to Std and Dlt if *any* error occurs
+	std, err = k.GetMUIStringValue("MUI_Std")
+	if err == nil {
+		dlt, err = k.GetMUIStringValue("MUI_Dlt")
 	}
 	if err != nil { // Fallback to Std and Dlt
 		if std, _, err = k.GetStringValue("Std"); err != nil {
@@ -65,7 +62,7 @@ func toEnglishName(stdname, dstname string) (string, error) {
 	}
 	defer k.Close()
 
-	names, err := k.ReadSubKeyNames(-1)
+	names, err := k.ReadSubKeyNames()
 	if err != nil {
 		return "", err
 	}
@@ -83,7 +80,7 @@ func extractCAPS(desc string) string {
 	var short []rune
 	for _, c := range desc {
 		if 'A' <= c && c <= 'Z' {
-			short = append(short, rune(c))
+			short = append(short, c)
 		}
 	}
 	return string(short)
@@ -134,11 +131,13 @@ func pseudoUnix(year int, d *syscall.Systemtime) int64 {
 			day -= 7
 		}
 	}
-	return t.sec + int64(day-1)*secondsPerDay + internalToUnix
+	return t.sec() + int64(day-1)*secondsPerDay + internalToUnix
 }
 
 func initLocalFromTZI(i *syscall.Timezoneinformation) {
 	l := &localLoc
+
+	l.name = "Local"
 
 	nzone := 1
 	if i.StandardDate.Month > 0 {
@@ -228,14 +227,6 @@ var aus = syscall.Timezoneinformation{
 	DaylightBias: -60,
 }
 
-func initTestingZone() {
-	initLocalFromTZI(&usPacific)
-}
-
-func initAusTestingZone() {
-	initLocalFromTZI(&aus)
-}
-
 func initLocal() {
 	var i syscall.Timezoneinformation
 	if _, err := syscall.GetTimeZoneInformation(&i); err != nil {
@@ -243,17 +234,4 @@ func initLocal() {
 		return
 	}
 	initLocalFromTZI(&i)
-}
-
-func loadLocation(name string) (*Location, error) {
-	z, err := loadZoneFile(runtime.GOROOT()+`\lib\time\zoneinfo.zip`, name)
-	if err != nil {
-		return nil, err
-	}
-	z.name = name
-	return z, nil
-}
-
-func forceZipFileForTesting(zipOnly bool) {
-	// We only use the zip file anyway.
 }

@@ -2,24 +2,29 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build !plan9
+//go:build !plan9
 
 package net
 
 import (
+	"errors"
 	"net/internal/socktest"
 	"strings"
 	"syscall"
 )
+
+func isUnreachableError(err error) bool {
+	return errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH)
+}
 
 func enableSocketConnect() {
 	sw.Set(socktest.FilterConnect, nil)
 }
 
 func disableSocketConnect(network string) {
-	ss := strings.Split(network, ":")
+	net, _, _ := strings.Cut(network, ":")
 	sw.Set(socktest.FilterConnect, func(so *socktest.Status) (socktest.AfterFilter, error) {
-		switch ss[0] {
+		switch net {
 		case "tcp4":
 			if so.Cookie.Family() == syscall.AF_INET && so.Cookie.Type() == syscall.SOCK_STREAM {
 				return nil, syscall.EHOSTUNREACH

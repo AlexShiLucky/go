@@ -6,6 +6,9 @@ package net
 
 import "os"
 
+// BUG(mikio): On JS, the FileConn, FileListener and
+// FilePacketConn functions are not implemented.
+
 type fileAddr string
 
 func (fileAddr) Network() string  { return "file+net" }

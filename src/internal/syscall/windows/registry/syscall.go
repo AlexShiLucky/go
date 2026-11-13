@@ -2,13 +2,11 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build windows
+//go:build windows
 
 package registry
 
 import "syscall"
-
-//go:generate go run $GOROOT/src/syscall/mksyscall_windows.go -output zsyscall_windows.go syscall.go
 
 const (
 	_REG_OPTION_NON_VOLATILE = 0
@@ -18,10 +16,6 @@ const (
 
 	_ERROR_NO_MORE_ITEMS syscall.Errno = 259
 )
-
-func LoadRegLoadMUIString() error {
-	return procRegLoadMUIStringW.Find()
-}
 
 //sys	regCreateKeyEx(key syscall.Handle, subkey *uint16, reserved uint32, class *uint16, options uint32, desired uint32, sa *syscall.SecurityAttributes, result *syscall.Handle, disposition *uint32) (regerrno error) = advapi32.RegCreateKeyExW
 //sys	regDeleteKey(key syscall.Handle, subkey *uint16) (regerrno error) = advapi32.RegDeleteKeyW

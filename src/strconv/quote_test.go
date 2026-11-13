@@ -6,6 +6,7 @@ package strconv_test
 
 import (
 	. "strconv"
+	"strings"
 	"testing"
 	"unicode"
 )
@@ -54,6 +55,7 @@ var quotetests = []quoteTest{
 	{"\x04", `"\x04"`, `"\x04"`, `"\x04"`},
 	// Some non-printable but graphic runes. Final column is double-quoted.
 	{"!\u00a0!\u2000!\u3000!", `"!\u00a0!\u2000!\u3000!"`, `"!\u00a0!\u2000!\u3000!"`, "\"!\u00a0!\u2000!\u3000!\""},
+	{"\x7f", `"\x7f"`, `"\x7f"`, `"\x7f"`},
 }
 
 func TestQuote(t *testing.T) {
@@ -89,6 +91,70 @@ func TestQuoteToGraphic(t *testing.T) {
 	}
 }
 
+func BenchmarkQuote(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		Quote("\a\b\f\r\n\t\v\a\b\f\r\n\t\v\a\b\f\r\n\t\v")
+	}
+}
+
+func BenchmarkQuoteRune(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		QuoteRune('\a')
+	}
+}
+
+var quoteRuneResult string
+
+func BenchmarkQuoteRuneEscaping(b *testing.B) {
+	cases := []struct {
+		name string
+		r    rune
+	}{
+		{"ASCII", 'a'},
+		{"Control", '\n'},
+		{"NonASCII", '界'},
+		{"GraphicSpace", '\u2000'},
+		{"NonBMP", '\U0010ffff'},
+		{"Invalid", -1},
+	}
+	for _, tc := range cases {
+		b.Run("QuoteRune/"+tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				quoteRuneResult = QuoteRune(tc.r)
+			}
+		})
+		b.Run("QuoteRuneToASCII/"+tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				quoteRuneResult = QuoteRuneToASCII(tc.r)
+			}
+		})
+		b.Run("QuoteRuneToGraphic/"+tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				quoteRuneResult = QuoteRuneToGraphic(tc.r)
+			}
+		})
+	}
+}
+
+var benchQuoteBuf []byte
+
+func BenchmarkAppendQuote(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		benchQuoteBuf = AppendQuote(benchQuoteBuf[:0], "\a\b\f\r\n\t\v\a\b\f\r\n\t\v\a\b\f\r\n\t\v")
+	}
+}
+
+var benchQuoteRuneBuf []byte
+
+func BenchmarkAppendQuoteRune(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		benchQuoteRuneBuf = AppendQuoteRune(benchQuoteRuneBuf[:0], '\a')
+	}
+}
+
 type quoteRuneTest struct {
 	in      rune
 	out     string
@@ -99,9 +165,13 @@ type quoteRuneTest struct {
 var quoterunetests = []quoteRuneTest{
 	{'a', `'a'`, `'a'`, `'a'`},
 	{'\a', `'\a'`, `'\a'`, `'\a'`},
+	{'\'', `'\''`, `'\''`, `'\''`},
 	{'\\', `'\\'`, `'\\'`, `'\\'`},
 	{0xFF, `'ÿ'`, `'\u00ff'`, `'ÿ'`},
 	{0x263a, `'☺'`, `'\u263a'`, `'☺'`},
+	{0x1f600, `'😀'`, `'\U0001f600'`, `'😀'`},
+	{-1, `'�'`, `'\ufffd'`, `'�'`},
+	{0xdead, `'�'`, `'\ufffd'`, `'�'`},
 	{0xfffd, `'�'`, `'\ufffd'`, `'�'`},
 	{0x0010ffff, `'\U0010ffff'`, `'\U0010ffff'`, `'\U0010ffff'`},
 	{0x0010ffff + 1, `'�'`, `'\ufffd'`, `'�'`},
@@ -145,6 +215,29 @@ func TestQuoteRuneToGraphic(t *testing.T) {
 	}
 }
 
+func TestQuoteRuneAllocs(t *testing.T) {
+	for _, variant := range []struct {
+		name  string
+		quote func(rune) string
+	}{
+		{"QuoteRune", QuoteRune},
+		{"QuoteRuneToASCII", QuoteRuneToASCII},
+		{"QuoteRuneToGraphic", QuoteRuneToGraphic},
+	} {
+		t.Run(variant.name, func(t *testing.T) {
+			for _, tt := range quoterunetests {
+				// Retain the result so the returned string escapes the call.
+				allocs := testing.AllocsPerRun(100, func() {
+					quoteRuneResult = variant.quote(tt.in)
+				})
+				if allocs > 1 {
+					t.Errorf("%s(%U) allocated %g times; want at most 1", variant.name, tt.in, allocs)
+				}
+			}
+		})
+	}
+}
+
 type canBackquoteTest struct {
 	in  string
 	out bool
@@ -152,39 +245,39 @@ type canBackquoteTest struct {
 
 var canbackquotetests = []canBackquoteTest{
 	{"`", false},
-	{string(0), false},
-	{string(1), false},
-	{string(2), false},
-	{string(3), false},
-	{string(4), false},
-	{string(5), false},
-	{string(6), false},
-	{string(7), false},
-	{string(8), false},
-	{string(9), true}, // \t
-	{string(10), false},
-	{string(11), false},
-	{string(12), false},
-	{string(13), false},
-	{string(14), false},
-	{string(15), false},
-	{string(16), false},
-	{string(17), false},
-	{string(18), false},
-	{string(19), false},
-	{string(20), false},
-	{string(21), false},
-	{string(22), false},
-	{string(23), false},
-	{string(24), false},
-	{string(25), false},
-	{string(26), false},
-	{string(27), false},
-	{string(28), false},
-	{string(29), false},
-	{string(30), false},
-	{string(31), false},
-	{string(0x7F), false},
+	{string(rune(0)), false},
+	{string(rune(1)), false},
+	{string(rune(2)), false},
+	{string(rune(3)), false},
+	{string(rune(4)), false},
+	{string(rune(5)), false},
+	{string(rune(6)), false},
+	{string(rune(7)), false},
+	{string(rune(8)), false},
+	{string(rune(9)), true}, // \t
+	{string(rune(10)), false},
+	{string(rune(11)), false},
+	{string(rune(12)), false},
+	{string(rune(13)), false},
+	{string(rune(14)), false},
+	{string(rune(15)), false},
+	{string(rune(16)), false},
+	{string(rune(17)), false},
+	{string(rune(18)), false},
+	{string(rune(19)), false},
+	{string(rune(20)), false},
+	{string(rune(21)), false},
+	{string(rune(22)), false},
+	{string(rune(23)), false},
+	{string(rune(24)), false},
+	{string(rune(25)), false},
+	{string(rune(26)), false},
+	{string(rune(27)), false},
+	{string(rune(28)), false},
+	{string(rune(29)), false},
+	{string(rune(30)), false},
+	{string(rune(31)), false},
+	{string(rune(0x7F)), false},
 	{`' !"#$%&'()*+,-./:;<=>?@[\]^_{|}~`, true},
 	{`0123456789`, true},
 	{`ABCDEFGHIJKLMNOPQRSTUVWXYZ`, true},
@@ -227,13 +320,22 @@ var unquotetests = []unQuoteTest{
 	{`'☹'`, "☹"},
 	{`'\a'`, "\a"},
 	{`'\x10'`, "\x10"},
-	{`'\377'`, "\377"},
 	{`'\u1234'`, "\u1234"},
 	{`'\U00010111'`, "\U00010111"},
 	{`'\t'`, "\t"},
 	{`' '`, " "},
 	{`'\''`, "'"},
 	{`'"'`, "\""},
+
+	// The correct result is the UTF-8 encoding of the rune,
+	// not a string whose sole byte has the same numeric
+	// value as the rune; see go.dev/issue/82205.
+	{`'\377'`, "\u00ff"},
+	{`'\xff'`, "\u00ff"},
+	{`'\u00ff'`, "\u00ff"},
+	{`'\U000000ff'`, "\u00ff"},
+	{`'\x80'`, "\u0080"},
+	{`'\200'`, "\u0080"},
 
 	{"``", ``},
 	{"`a`", `a`},
@@ -246,6 +348,7 @@ var unquotetests = []unQuoteTest{
 	{"`\n`", "\n"},
 	{"`	`", `	`},
 	{"` `", ` `},
+	{"`a\rb`", "ab"},
 }
 
 var misquoted = []string{
@@ -268,32 +371,74 @@ var misquoted = []string{
 	`"\z"`,
 	"`",
 	"`xxx",
+	"``x\r",
 	"`\"",
 	`"\'"`,
 	`'\"'`,
 	"\"\n\"",
 	"\"\\n\n\"",
 	"'\n'",
+	`"\udead"`,
+	`"\ud83d\ude4f"`,
 }
 
 func TestUnquote(t *testing.T) {
 	for _, tt := range unquotetests {
-		if out, err := Unquote(tt.in); err != nil && out != tt.out {
-			t.Errorf("Unquote(%#q) = %q, %v want %q, nil", tt.in, out, err, tt.out)
-		}
+		testUnquote(t, tt.in, tt.out, nil)
 	}
-
-	// run the quote tests too, backward
 	for _, tt := range quotetests {
-		if in, err := Unquote(tt.out); in != tt.in {
-			t.Errorf("Unquote(%#q) = %q, %v, want %q, nil", tt.out, in, err, tt.in)
-		}
+		testUnquote(t, tt.out, tt.in, nil)
+	}
+	for _, s := range misquoted {
+		testUnquote(t, s, "", ErrSyntax)
+	}
+}
+
+// Issue 23685: invalid UTF-8 should not go through the fast path.
+func TestUnquoteInvalidUTF8(t *testing.T) {
+	tests := []struct {
+		in string
+
+		// one of:
+		want    string
+		wantErr error
+	}{
+		{in: `"foo"`, want: "foo"},
+		{in: `"foo`, wantErr: ErrSyntax},
+		{in: `"` + "\xc0" + `"`, want: "\xef\xbf\xbd"},
+		{in: `"a` + "\xc0" + `"`, want: "a\xef\xbf\xbd"},
+		{in: `"\t` + "\xc0" + `"`, want: "\t\xef\xbf\xbd"},
+	}
+	for _, tt := range tests {
+		testUnquote(t, tt.in, tt.want, tt.wantErr)
+	}
+}
+
+func testUnquote(t *testing.T, in, want string, wantErr error) {
+	// Test Unquote.
+	got, gotErr := Unquote(in)
+	if got != want || gotErr != wantErr {
+		t.Errorf("Unquote(%q) = (%q, %v), want (%q, %v)", in, got, gotErr, want, wantErr)
 	}
 
-	for _, s := range misquoted {
-		if out, err := Unquote(s); out != "" || err != ErrSyntax {
-			t.Errorf("Unquote(%#q) = %q, %v want %q, %v", s, out, err, "", ErrSyntax)
-		}
+	// Test QuotedPrefix.
+	// Adding an arbitrary suffix should not change the result of QuotedPrefix
+	// assume that the suffix doesn't accidentally terminate a truncated input.
+	if gotErr == nil {
+		want = in
+	}
+	suffix := "\n\r\\\"`'" // special characters for quoted strings
+	if len(in) > 0 {
+		suffix = strings.ReplaceAll(suffix, in[:1], "")
+	}
+	in += suffix
+	got, gotErr = QuotedPrefix(in)
+	if gotErr == nil && wantErr != nil {
+		_, wantErr = Unquote(got) // original input had trailing junk, reparse with only valid prefix
+		want = got
+	}
+	if got != want || gotErr != wantErr {
+		t.Errorf("QuotedPrefix(%q) = (%q, %v), want (%q, %v)", in, got, gotErr, want, wantErr)
 	}
 }
 

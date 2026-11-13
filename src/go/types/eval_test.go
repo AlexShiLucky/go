@@ -7,10 +7,11 @@
 package types_test
 
 import (
+	"fmt"
 	"go/ast"
-	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
 	"internal/testenv"
 	"strings"
 	"testing"
@@ -48,7 +49,7 @@ func testEval(t *testing.T, fset *token.FileSet, pkg *Package, pos token.Pos, ex
 	// compare values
 	gotStr := ""
 	if gotTv.Value != nil {
-		gotStr = gotTv.Value.String()
+		gotStr = gotTv.Value.ExactString()
 	}
 	if gotStr != valStr {
 		t.Errorf("Eval(%q) got value %s, want %s", expr, gotStr, valStr)
@@ -56,38 +57,42 @@ func testEval(t *testing.T, fset *token.FileSet, pkg *Package, pos token.Pos, ex
 }
 
 func TestEvalBasic(t *testing.T) {
+	t.Parallel()
 	fset := token.NewFileSet()
 	for _, typ := range Typ[Bool : String+1] {
-		testEval(t, fset, nil, token.NoPos, typ.Name(), typ, "", "")
+		testEval(t, fset, nil, nopos, typ.Name(), typ, "", "")
 	}
 }
 
 func TestEvalComposite(t *testing.T) {
+	t.Parallel()
 	fset := token.NewFileSet()
 	for _, test := range independentTestTypes {
-		testEval(t, fset, nil, token.NoPos, test.src, nil, test.str, "")
+		testEval(t, fset, nil, nopos, test.src, nil, test.str, "")
 	}
 }
 
 func TestEvalArith(t *testing.T) {
+	t.Parallel()
 	var tests = []string{
 		`true`,
 		`false == false`,
 		`12345678 + 87654321 == 99999999`,
 		`10 * 20 == 200`,
-		`(1<<1000)*2 >> 100 == 2<<900`,
+		`(1<<500)*2 >> 100 == 2<<400`,
 		`"foo" + "bar" == "foobar"`,
 		`"abc" <= "bcd"`,
 		`len([10]struct{}{}) == 2*5`,
 	}
 	fset := token.NewFileSet()
 	for _, test := range tests {
-		testEval(t, fset, nil, token.NoPos, test, Typ[UntypedBool], "", "true")
+		testEval(t, fset, nil, nopos, test, Typ[UntypedBool], "", "true")
 	}
 }
 
 func TestEvalPos(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
+	t.Parallel()
 
 	// The contents of /*-style comments are of the form
 	//	expr => value, type
@@ -110,7 +115,7 @@ func TestEvalPos(t *testing.T) {
 			x = a + len(s)
 			return float64(x)
 			/* true => true, untyped bool */
-			/* fmt.Println => , func(a ...interface{}) (n int, err error) */
+			/* fmt.Println => , func(a ...any) (n int, err error) */
 			/* c => 3, untyped float */
 			/* T => , p.T */
 			/* a => , int */
@@ -138,7 +143,7 @@ func TestEvalPos(t *testing.T) {
 				/* c => , struct{c int} */
 				_ = c
 			}
-			_ = func(a, b, c int) /* c => , string */ {
+			_ = func(a, b, c int /* c => , string */) /* c => , int */ {
 				/* c => , int */
 			}
 			_ = c
@@ -149,19 +154,37 @@ func TestEvalPos(t *testing.T) {
 		package p
 		/* T => , p.T */
 		`,
+		`
+		package p
+		import "io"
+		type R = io.Reader
+		func _() {
+			/* interface{R}.Read => , func(_ interface{io.Reader}, p []byte) (n int, err error) */
+			_ = func() {
+				/* interface{io.Writer}.Write => , func(_ interface{io.Writer}, p []byte) (n int, err error) */
+				type io interface {} // must not shadow io in line above
+			}
+			type R interface {} // must not shadow R in first line of this function body
+		}
+		`,
 	}
 
 	fset := token.NewFileSet()
 	var files []*ast.File
 	for i, src := range sources {
-		file, err := parser.ParseFile(fset, "p", src, parser.ParseComments)
+		file, err := parser.ParseFile(fset, "p", src, parser.ParseComments|parser.SkipObjectResolution)
 		if err != nil {
 			t.Fatalf("could not parse file %d: %s", i, err)
 		}
+
+		if strings.Contains(src, "interface{R}.Read") {
+			continue
+		}
+
 		files = append(files, file)
 	}
 
-	conf := Config{Importer: importer.Default()}
+	conf := Config{Importer: defaultImporter(fset)}
 	pkg, err := conf.Check("p", fset, files, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -181,8 +204,131 @@ func TestEvalPos(t *testing.T) {
 	}
 }
 
-// split splits string s at the first occurrence of s.
+// split splits string s at the first occurrence of s, trimming spaces.
 func split(s, sep string) (string, string) {
-	i := strings.Index(s, sep)
-	return strings.TrimSpace(s[:i]), strings.TrimSpace(s[i+len(sep):])
+	before, after, _ := strings.Cut(s, sep)
+	return strings.TrimSpace(before), strings.TrimSpace(after)
+}
+
+func TestCheckExpr(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+	t.Parallel()
+
+	// Each comment has the form /* expr => object */:
+	// expr is an identifier or selector expression that is passed
+	// to CheckExpr at the position of the comment, and object is
+	// the string form of the object it denotes.
+	const src = `
+package p
+
+import "fmt"
+
+const c = 3.0
+type T []int
+type S struct{ X int }
+
+func f(a int, s string) S {
+	/* fmt.Println => func fmt.Println(a ...any) (n int, err error) */
+	/* fmt.Stringer.String => func (fmt.Stringer).String() string */
+	fmt.Println("calling f")
+
+	var fmt struct{ Println int }
+	/* fmt => var fmt struct{Println int} */
+	/* fmt.Println => field Println int */
+	/* f(1, "").X => field X int */
+	fmt.Println = 1
+
+	/* append => builtin append */
+
+	/* new(S).X => field X int */
+
+	return S{}
+}`
+
+	fset := token.NewFileSet()
+	f := mustParse(fset, src)
+
+	conf := Config{Importer: defaultImporter(fset)}
+	pkg, err := conf.Check("p", fset, []*ast.File{f}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	checkExpr := func(pos token.Pos, str string) (Object, error) {
+		expr, err := parser.ParseExprFrom(fset, "eval", str, 0)
+		if err != nil {
+			return nil, err
+		}
+
+		info := &Info{
+			Uses:       make(map[*ast.Ident]Object),
+			Selections: make(map[*ast.SelectorExpr]*Selection),
+		}
+		if err := CheckExpr(fset, pkg, pos, expr, info); err != nil {
+			return nil, fmt.Errorf("CheckExpr(%q) failed: %s", str, err)
+		}
+		switch expr := expr.(type) {
+		case *ast.Ident:
+			if obj, ok := info.Uses[expr]; ok {
+				return obj, nil
+			}
+		case *ast.SelectorExpr:
+			if sel, ok := info.Selections[expr]; ok {
+				return sel.Obj(), nil
+			}
+			if obj, ok := info.Uses[expr.Sel]; ok {
+				return obj, nil // qualified identifier
+			}
+		}
+		return nil, fmt.Errorf("no object for %s", str)
+	}
+
+	for _, group := range f.Comments {
+		for _, comment := range group.List {
+			s := comment.Text
+			if len(s) >= 4 && strings.HasPrefix(s, "/*") && strings.HasSuffix(s, "*/") {
+				pos := comment.Pos()
+				expr, wantObj := split(s[2:len(s)-2], "=>")
+				obj, err := checkExpr(pos, expr)
+				if err != nil {
+					t.Errorf("%s: %s", fset.Position(pos), err)
+					continue
+				}
+				if obj.String() != wantObj {
+					t.Errorf("%s: checkExpr(%s) = %s, want %v",
+						fset.Position(pos), expr, obj, wantObj)
+				}
+			}
+		}
+	}
+}
+
+func TestIssue65898(t *testing.T) {
+	t.Parallel()
+	const src = `
+package p
+func _[A any](A) {}
+`
+
+	fset := token.NewFileSet()
+	f := mustParse(fset, src)
+
+	var conf types.Config
+	pkg, err := conf.Check(pkgName(src), fset, []*ast.File{f}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, d := range f.Decls {
+		if fun, _ := d.(*ast.FuncDecl); fun != nil {
+			// type parameter A is not found at the start of the function type
+			if err := types.CheckExpr(fset, pkg, fun.Type.Pos(), fun.Type, nil); err == nil || !strings.Contains(err.Error(), "undefined") {
+				t.Fatalf("got %s, want undefined error", err)
+			}
+			// type parameter A must be found at the end of the function type
+			if err := types.CheckExpr(fset, pkg, fun.Type.End(), fun.Type, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 }

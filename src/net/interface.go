@@ -1,10 +1,22 @@
-// Copyright 2011 The Go Authors.  All rights reserved.
+// Copyright 2011 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
 package net
 
-import "errors"
+import (
+	"errors"
+	"internal/strconv"
+	"sync"
+	"time"
+	_ "unsafe"
+)
+
+// BUG(mikio): On JS, methods and functions related to
+// Interface are not implemented.
+
+// BUG(mikio): On AIX, DragonFly BSD, NetBSD, OpenBSD, Plan 9 and
+// Solaris, the MulticastAddrs method of Interface is not implemented.
 
 var (
 	errInvalidInterface         = errors.New("invalid network interface")
@@ -14,13 +26,30 @@ var (
 	errNoSuchMulticastInterface = errors.New("no such multicast network interface")
 )
 
+// An interfaceAddr is the Addr of an OpError about a network
+// interface: its name, or its index when it was asked for by index,
+// printed in decimal as an IPv6 zone names an interface either way.
+type interfaceAddr struct {
+	name  string
+	index int
+}
+
+func (a interfaceAddr) Network() string { return "ip+net" }
+
+func (a interfaceAddr) String() string {
+	if a.name != "" {
+		return a.name
+	}
+	return strconv.Itoa(a.index)
+}
+
 // Interface represents a mapping between network interface name
-// and index.  It also represents network interface facility
+// and index. It also represents network interface facility
 // information.
 type Interface struct {
 	Index        int          // positive integer that starts at one, zero is never used
 	MTU          int          // maximum transmission unit
-	Name         string       // e.g., "en0", "lo0", "eth0.100"
+	Name         string       // e.g., "en0", "lo0", "eth0.100"; may be the empty string
 	HardwareAddr HardwareAddr // IEEE MAC-48, EUI-48 and EUI-64 form
 	Flags        Flags        // e.g., FlagUp, FlagLoopback, FlagMulticast
 }
@@ -28,11 +57,12 @@ type Interface struct {
 type Flags uint
 
 const (
-	FlagUp           Flags = 1 << iota // interface is up
+	FlagUp           Flags = 1 << iota // interface is administratively up
 	FlagBroadcast                      // interface supports broadcast access capability
 	FlagLoopback                       // interface is a loopback interface
 	FlagPointToPoint                   // interface belongs to a point-to-point link
 	FlagMulticast                      // interface supports multicast access capability
+	FlagRunning                        // interface is in running state
 )
 
 var flagNames = []string{
@@ -41,6 +71,7 @@ var flagNames = []string{
 	"loopback",
 	"pointtopoint",
 	"multicast",
+	"running",
 }
 
 func (f Flags) String() string {
@@ -59,27 +90,28 @@ func (f Flags) String() string {
 	return s
 }
 
-// Addrs returns interface addresses for a specific interface.
+// Addrs returns a list of unicast interface addresses for a specific
+// interface.
 func (ifi *Interface) Addrs() ([]Addr, error) {
 	if ifi == nil {
 		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: errInvalidInterface}
 	}
 	ifat, err := interfaceAddrTable(ifi)
 	if err != nil {
-		err = &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: err}
+		err = &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{name: ifi.Name}, Err: err}
 	}
 	return ifat, err
 }
 
-// MulticastAddrs returns multicast, joined group addresses for
-// a specific interface.
+// MulticastAddrs returns a list of multicast, joined group addresses
+// for a specific interface.
 func (ifi *Interface) MulticastAddrs() ([]Addr, error) {
 	if ifi == nil {
 		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: errInvalidInterface}
 	}
 	ifat, err := interfaceMulticastAddrTable(ifi)
 	if err != nil {
-		err = &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: err}
+		err = &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{name: ifi.Name}, Err: err}
 	}
 	return ifat, err
 }
@@ -88,13 +120,19 @@ func (ifi *Interface) MulticastAddrs() ([]Addr, error) {
 func Interfaces() ([]Interface, error) {
 	ift, err := interfaceTable(0)
 	if err != nil {
-		err = &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: err}
+		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: err}
 	}
-	return ift, err
+	if len(ift) != 0 {
+		zoneCache.update(ift, false)
+	}
+	return ift, nil
 }
 
-// InterfaceAddrs returns a list of the system's network interface
+// InterfaceAddrs returns a list of the system's unicast interface
 // addresses.
+//
+// The returned list does not identify the associated interface; use
+// Interfaces and [Interface.Addrs] for more detail.
 func InterfaceAddrs() ([]Addr, error) {
 	ifat, err := interfaceAddrTable(nil)
 	if err != nil {
@@ -104,17 +142,21 @@ func InterfaceAddrs() ([]Addr, error) {
 }
 
 // InterfaceByIndex returns the interface specified by index.
+//
+// On Solaris, it returns one of the logical network interfaces
+// sharing the logical data link; for more precision use
+// [InterfaceByName].
 func InterfaceByIndex(index int) (*Interface, error) {
 	if index <= 0 {
-		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: errInvalidInterfaceIndex}
+		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{index: index}, Err: errInvalidInterfaceIndex}
 	}
 	ift, err := interfaceTable(index)
 	if err != nil {
-		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: err}
+		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{index: index}, Err: err}
 	}
 	ifi, err := interfaceByIndex(ift, index)
 	if err != nil {
-		err = &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: err}
+		err = &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{index: index}, Err: err}
 	}
 	return ifi, err
 }
@@ -135,12 +177,103 @@ func InterfaceByName(name string) (*Interface, error) {
 	}
 	ift, err := interfaceTable(0)
 	if err != nil {
-		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: err}
+		return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{name: name}, Err: err}
+	}
+	if len(ift) != 0 {
+		zoneCache.update(ift, false)
 	}
 	for _, ifi := range ift {
 		if name == ifi.Name {
 			return &ifi, nil
 		}
 	}
-	return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: nil, Err: errNoSuchInterface}
+	return nil, &OpError{Op: "route", Net: "ip+net", Source: nil, Addr: interfaceAddr{name: name}, Err: errNoSuchInterface}
+}
+
+// An ipv6ZoneCache represents a cache holding partial network
+// interface information. It is used for reducing the cost of IPv6
+// addressing scope zone resolution.
+//
+// Multiple names sharing the index are managed by first-come
+// first-served basis for consistency.
+type ipv6ZoneCache struct {
+	sync.RWMutex                // guard the following
+	lastFetched  time.Time      // last time routing information was fetched
+	toIndex      map[string]int // interface name to its index
+	toName       map[int]string // interface index to its name
+}
+
+var zoneCache = ipv6ZoneCache{
+	toIndex: make(map[string]int),
+	toName:  make(map[int]string),
+}
+
+// update refreshes the network interface information if the cache was last
+// updated more than 1 minute ago, or if force is set. It reports whether the
+// cache was updated.
+func (zc *ipv6ZoneCache) update(ift []Interface, force bool) (updated bool) {
+	zc.Lock()
+	defer zc.Unlock()
+	now := time.Now()
+	if !force && zc.lastFetched.After(now.Add(-60*time.Second)) {
+		return false
+	}
+	zc.lastFetched = now
+	if len(ift) == 0 {
+		var err error
+		if ift, err = interfaceTable(0); err != nil {
+			return false
+		}
+	}
+	zc.toIndex = make(map[string]int, len(ift))
+	zc.toName = make(map[int]string, len(ift))
+	for _, ifi := range ift {
+		if ifi.Name != "" {
+			zc.toIndex[ifi.Name] = ifi.Index
+			if _, ok := zc.toName[ifi.Index]; !ok {
+				zc.toName[ifi.Index] = ifi.Name
+			}
+		}
+	}
+	return true
+}
+
+func (zc *ipv6ZoneCache) name(index int) string {
+	if index == 0 {
+		return ""
+	}
+	updated := zoneCache.update(nil, false)
+	zoneCache.RLock()
+	name, ok := zoneCache.toName[index]
+	zoneCache.RUnlock()
+	if !ok && !updated {
+		zoneCache.update(nil, true)
+		zoneCache.RLock()
+		name, ok = zoneCache.toName[index]
+		zoneCache.RUnlock()
+	}
+	if !ok { // last resort
+		name = strconv.Itoa(index)
+	}
+	return name
+}
+
+func (zc *ipv6ZoneCache) index(name string) int {
+	if name == "" {
+		return 0
+	}
+	updated := zoneCache.update(nil, false)
+	zoneCache.RLock()
+	index, ok := zoneCache.toIndex[name]
+	zoneCache.RUnlock()
+	if !ok && !updated {
+		zoneCache.update(nil, true)
+		zoneCache.RLock()
+		index, ok = zoneCache.toIndex[name]
+		zoneCache.RUnlock()
+	}
+	if !ok { // last resort
+		index, _, _ = dtoi(name)
+	}
+	return index
 }

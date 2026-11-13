@@ -5,8 +5,12 @@
 package net
 
 import (
-	"reflect"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
+	"time"
 )
 
 type staticHostEntry struct {
@@ -35,7 +39,7 @@ var lookupStaticHostTests = []struct {
 		},
 	},
 	{
-		"testdata/ipv4-hosts", // see golang.org/issue/8996
+		"testdata/ipv4-hosts",
 		[]staticHostEntry{
 			{"localhost", []string{"127.0.0.1", "127.0.0.2", "127.0.0.3"}},
 			{"localhost.localdomain", []string{"127.0.0.3"}},
@@ -48,18 +52,32 @@ var lookupStaticHostTests = []struct {
 			{"localhost.localdomain", []string{"fe80::3%lo0"}},
 		},
 	},
+	{
+		"testdata/case-hosts", // see golang.org/issue/12806
+		[]staticHostEntry{
+			{"PreserveMe", []string{"127.0.0.1", "::1"}},
+			{"PreserveMe.local", []string{"127.0.0.1", "::1"}},
+		},
+	},
 }
 
 func TestLookupStaticHost(t *testing.T) {
-	defer func(orig string) { testHookHostsPath = orig }(testHookHostsPath)
+	defer func(orig string) { hostsFilePath = orig }(hostsFilePath)
 
 	for _, tt := range lookupStaticHostTests {
-		testHookHostsPath = tt.name
+		hostsFilePath = tt.name
 		for _, ent := range tt.ents {
-			addrs := lookupStaticHost(ent.in)
-			if !reflect.DeepEqual(addrs, ent.out) {
-				t.Errorf("%s, lookupStaticHost(%s) = %v; want %v", tt.name, ent.in, addrs, ent.out)
-			}
+			testStaticHost(t, tt.name, ent)
+		}
+	}
+}
+
+func testStaticHost(t *testing.T, hostsPath string, ent staticHostEntry) {
+	ins := []string{ent.in, absDomainName(ent.in), strings.ToLower(ent.in), strings.ToUpper(ent.in)}
+	for _, in := range ins {
+		addrs, _ := lookupStaticHost(in)
+		if !slices.Equal(addrs, ent.out) {
+			t.Errorf("%s, lookupStaticHost(%s) = %v; want %v", hostsPath, in, addrs, ent.out)
 		}
 	}
 }
@@ -87,7 +105,7 @@ var lookupStaticAddrTests = []struct {
 		},
 	},
 	{
-		"testdata/ipv4-hosts", // see golang.org/issue/8996
+		"testdata/ipv4-hosts",
 		[]staticHostEntry{
 			{"127.0.0.1", []string{"localhost"}},
 			{"127.0.0.2", []string{"localhost"}},
@@ -103,18 +121,130 @@ var lookupStaticAddrTests = []struct {
 			{"fe80::3%lo0", []string{"localhost", "localhost.localdomain"}},
 		},
 	},
+	{
+		"testdata/case-hosts", // see golang.org/issue/12806
+		[]staticHostEntry{
+			{"127.0.0.1", []string{"PreserveMe", "PreserveMe.local"}},
+			{"::1", []string{"PreserveMe", "PreserveMe.local"}},
+		},
+	},
 }
 
 func TestLookupStaticAddr(t *testing.T) {
-	defer func(orig string) { testHookHostsPath = orig }(testHookHostsPath)
+	defer func(orig string) { hostsFilePath = orig }(hostsFilePath)
 
 	for _, tt := range lookupStaticAddrTests {
-		testHookHostsPath = tt.name
+		hostsFilePath = tt.name
 		for _, ent := range tt.ents {
-			hosts := lookupStaticAddr(ent.in)
-			if !reflect.DeepEqual(hosts, ent.out) {
-				t.Errorf("%s, lookupStaticAddr(%s) = %v; want %v", tt.name, ent.in, hosts, ent.out)
-			}
+			testStaticAddr(t, tt.name, ent)
 		}
 	}
+}
+
+func testStaticAddr(t *testing.T, hostsPath string, ent staticHostEntry) {
+	hosts := lookupStaticAddr(ent.in)
+	for i := range ent.out {
+		ent.out[i] = absDomainName(ent.out[i])
+	}
+	if !slices.Equal(hosts, ent.out) {
+		t.Errorf("%s, lookupStaticAddr(%s) = %v; want %v", hostsPath, ent.in, hosts, ent.out)
+	}
+}
+
+func TestHostCacheModification(t *testing.T) {
+	// Ensure that programs can't modify the internals of the host cache.
+	// See https://golang.org/issues/14212.
+	defer func(orig string) { hostsFilePath = orig }(hostsFilePath)
+
+	hostsFilePath = "testdata/ipv4-hosts"
+	ent := staticHostEntry{"localhost", []string{"127.0.0.1", "127.0.0.2", "127.0.0.3"}}
+	testStaticHost(t, hostsFilePath, ent)
+	// Modify the addresses return by lookupStaticHost.
+	addrs, _ := lookupStaticHost(ent.in)
+	for i := range addrs {
+		addrs[i] += "junk"
+	}
+	testStaticHost(t, hostsFilePath, ent)
+
+	hostsFilePath = "testdata/ipv6-hosts"
+	ent = staticHostEntry{"::1", []string{"localhost"}}
+	testStaticAddr(t, hostsFilePath, ent)
+	// Modify the hosts return by lookupStaticAddr.
+	hosts := lookupStaticAddr(ent.in)
+	for i := range hosts {
+		hosts[i] += "junk"
+	}
+	testStaticAddr(t, hostsFilePath, ent)
+}
+
+var lookupStaticHostAliasesTest = []struct {
+	lookup, res string
+}{
+	// 127.0.0.1
+	{"test", "test"},
+	// 127.0.0.2
+	{"test2.example.com", "test2.example.com"},
+	{"2.test", "test2.example.com"},
+	// 127.0.0.3
+	{"test3.example.com", "3.test"},
+	{"3.test", "3.test"},
+	// 127.0.0.4
+	{"example.com", "example.com"},
+	// 127.0.0.5
+	{"test5.example.com", "test4.example.com"},
+	{"5.test", "test4.example.com"},
+	{"4.test", "test4.example.com"},
+	{"test4.example.com", "test4.example.com"},
+}
+
+func TestLookupStaticHostAliases(t *testing.T) {
+	defer func(orig string) { hostsFilePath = orig }(hostsFilePath)
+
+	hostsFilePath = "testdata/aliases"
+	for _, ent := range lookupStaticHostAliasesTest {
+		testLookupStaticHostAliases(t, ent.lookup, absDomainName(ent.res))
+	}
+}
+
+func testLookupStaticHostAliases(t *testing.T, lookup, lookupRes string) {
+	ins := []string{lookup, absDomainName(lookup), strings.ToLower(lookup), strings.ToUpper(lookup)}
+	for _, in := range ins {
+		_, res := lookupStaticHost(in)
+		if res != lookupRes {
+			t.Errorf("lookupStaticHost(%v): got %v, want %v", in, res, lookupRes)
+		}
+	}
+}
+
+func TestHostCacheFileReplaced(t *testing.T) {
+	defer func(orig string) { hostsFilePath = orig }(hostsFilePath)
+
+	dir := t.TempDir()
+	hp := filepath.Join(dir, "hosts")
+	if err := os.WriteFile(hp, []byte("192.168.1.1 myhost\n"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	replacement := filepath.Join(dir, "newhosts")
+	if err := os.WriteFile(replacement, []byte("192.168.1.2 myhost\n"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	// Give both files the same modification time and size, so that only the
+	// file identity tells them apart. See https://go.dev/issue/81565.
+	mtime := time.Unix(1136214245, 0)
+	for _, name := range []string{hp, replacement} {
+		if err := os.Chtimes(name, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	hostsFilePath = hp
+	testStaticHost(t, hp, staticHostEntry{"myhost", []string{"192.168.1.1"}})
+
+	if err := os.Rename(replacement, hp); err != nil {
+		t.Fatal(err)
+	}
+	hosts.Lock()
+	hosts.expire = time.Now().Add(-cacheMaxAge)
+	hosts.Unlock()
+	testStaticHost(t, hp, staticHostEntry{"myhost", []string{"192.168.1.2"}})
 }

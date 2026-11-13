@@ -1,4 +1,4 @@
-// Copyright 2009,2010 The Go Authors. All rights reserved.
+// Copyright 2009,2010,2020 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -12,7 +12,77 @@
 
 package syscall
 
-import "unsafe"
+import (
+	"internal/abi"
+	"unsafe"
+)
+
+var dupTrampoline = abi.FuncPCABI0(libc_dup3_trampoline)
+
+func init() {
+	execveLibc = execve
+}
+
+func syscallInternal(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
+	// OpenBSD 7.5+ no longer supports indirect syscalls. A number of Go
+	// packages make use of syscall.Syscall with SYS_IOCTL since it is
+	// not well supported by golang.org/x/sys/unix. Reroute this system
+	// call number to the respective libc stub so that it continues to
+	// work for the time being. See #63900 for further details.
+	if trap == SYS_IOCTL {
+		return syscallX(abi.FuncPCABI0(libc_ioctl_trampoline), a1, a2, a3)
+	}
+	return 0, 0, ENOSYS
+}
+
+func syscall6Internal(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno) {
+	// OpenBSD 7.5+ no longer supports indirect syscalls. A number of Go
+	// packages make use of syscall.Syscall with SYS___SYSCTL since it is
+	// not well supported by golang.org/x/sys/unix. Reroute this system
+	// call number to the respective libc stub so that it continues to
+	// work for the time being. See #63900 for further details.
+	if trap == SYS___SYSCTL {
+		return syscall6X(abi.FuncPCABI0(libc_sysctl_trampoline), a1, a2, a3, a4, a5, a6)
+	}
+	return 0, 0, ENOSYS
+}
+
+func rawSyscallInternal(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno) {
+	return 0, 0, ENOSYS
+}
+
+func rawSyscall6Internal(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno) {
+	return 0, 0, ENOSYS
+}
+
+func syscall9Internal(trap, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err Errno) {
+	return 0, 0, ENOSYS
+}
+
+// Implemented in the runtime package (runtime/sys_openbsd.go)
+func syscall(fn, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno)
+func syscallX(fn, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno)
+func syscall6(fn, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
+func syscall6X(fn, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
+func syscall10(fn, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 uintptr) (r1, r2 uintptr, err Errno)
+func syscall10X(fn, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 uintptr) (r1, r2 uintptr, err Errno)
+func rawSyscall(fn, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno)
+func rawSyscall6(fn, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
+func rawSyscall6X(fn, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
+func rawSyscall10X(fn, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10 uintptr) (r1, r2 uintptr, err Errno)
+
+func syscall9(fn, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err Errno) {
+	return syscall10(fn, a1, a2, a3, a4, a5, a6, a7, a8, a9, 0)
+}
+func syscall9X(fn, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err Errno) {
+	return syscall10X(fn, a1, a2, a3, a4, a5, a6, a7, a8, a9, 0)
+}
+
+func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno)
+func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
+func Syscall9(num, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err Errno)
+func RawSyscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err Errno)
+func RawSyscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
 
 type SockaddrDatalink struct {
 	Len    uint8
@@ -26,15 +96,12 @@ type SockaddrDatalink struct {
 	raw    RawSockaddrDatalink
 }
 
-func Syscall9(trap, a1, a2, a3, a4, a5, a6, a7, a8, a9 uintptr) (r1, r2 uintptr, err Errno)
-
 func nametomib(name string) (mib []_C_int, err error) {
-
 	// Perform lookup via a binary search
 	left := 0
 	right := len(sysctlMib) - 1
 	for {
-		idx := left + (right-left)/2
+		idx := int(uint(left+right) >> 1)
 		switch {
 		case name == sysctlMib[idx].ctlname:
 			return sysctlMib[idx].ctloid, nil
@@ -50,69 +117,76 @@ func nametomib(name string) (mib []_C_int, err error) {
 	return nil, EINVAL
 }
 
-// ParseDirent parses up to max directory entries in buf,
-// appending the names to names. It returns the number
-// bytes consumed from buf, the number of entries added
-// to names, and the new names slice.
-func ParseDirent(buf []byte, max int, names []string) (consumed int, count int, newnames []string) {
-	origlen := len(buf)
-	for max != 0 && len(buf) > 0 {
-		dirent := (*Dirent)(unsafe.Pointer(&buf[0]))
-		if dirent.Reclen == 0 {
-			buf = nil
-			break
-		}
-		buf = buf[dirent.Reclen:]
-		if dirent.Fileno == 0 { // File absent in directory.
-			continue
-		}
-		bytes := (*[10000]byte)(unsafe.Pointer(&dirent.Name[0]))
-		var name = string(bytes[0:dirent.Namlen])
-		if name == "." || name == ".." { // Useless names
-			continue
-		}
-		max--
-		count++
-		names = append(names, name)
-	}
-	return origlen - len(buf), count, names
+func direntIno(buf []byte) (uint64, bool) {
+	return readInt(buf, unsafe.Offsetof(Dirent{}.Fileno), unsafe.Sizeof(Dirent{}.Fileno))
 }
 
-//sysnb pipe(p *[2]_C_int) (err error)
-func Pipe(p []int) (err error) {
+func direntReclen(buf []byte) (uint64, bool) {
+	return readInt(buf, unsafe.Offsetof(Dirent{}.Reclen), unsafe.Sizeof(Dirent{}.Reclen))
+}
+
+func direntNamlen(buf []byte) (uint64, bool) {
+	return readInt(buf, unsafe.Offsetof(Dirent{}.Namlen), unsafe.Sizeof(Dirent{}.Namlen))
+}
+
+func Pipe(p []int) error {
+	return Pipe2(p, 0)
+}
+
+//sysnb pipe2(p *[2]_C_int, flags int) (err error)
+
+func Pipe2(p []int, flags int) error {
 	if len(p) != 2 {
 		return EINVAL
 	}
 	var pp [2]_C_int
-	err = pipe(&pp)
-	p[0] = int(pp[0])
-	p[1] = int(pp[1])
+	err := pipe2(&pp, flags)
+	if err == nil {
+		p[0] = int(pp[0])
+		p[1] = int(pp[1])
+	}
+	return err
+}
+
+//sys	accept4(fd int, rsa *RawSockaddrAny, addrlen *_Socklen, flags int) (nfd int, err error)
+
+func Accept4(fd, flags int) (nfd int, sa Sockaddr, err error) {
+	var rsa RawSockaddrAny
+	var len _Socklen = SizeofSockaddrAny
+	nfd, err = accept4(fd, &rsa, &len, flags)
+	if err != nil {
+		return
+	}
+	if len > SizeofSockaddrAny {
+		panic("RawSockaddrAny too small")
+	}
+	sa, err = anyToSockaddr(&rsa)
+	if err != nil {
+		Close(nfd)
+		nfd = 0
+	}
 	return
 }
 
 //sys getdents(fd int, buf []byte) (n int, err error)
+
 func Getdirentries(fd int, buf []byte, basep *uintptr) (n int, err error) {
 	return getdents(fd, buf)
 }
 
-// TODO
+// TODO, see golang.org/issue/5847
 func sendfile(outfd int, infd int, offset *int64, count int) (written int, err error) {
 	return -1, ENOSYS
 }
 
 func Getfsstat(buf []Statfs_t, flags int) (n int, err error) {
-	var _p0 unsafe.Pointer
+	var bufptr *Statfs_t
 	var bufsize uintptr
 	if len(buf) > 0 {
-		_p0 = unsafe.Pointer(&buf[0])
+		bufptr = &buf[0]
 		bufsize = unsafe.Sizeof(Statfs_t{}) * uintptr(len(buf))
 	}
-	r0, _, e1 := Syscall(SYS_GETFSSTAT, uintptr(_p0), bufsize, uintptr(flags))
-	n = int(r0)
-	if e1 != 0 {
-		err = e1
-	}
-	return
+	return getfsstat(bufptr, bufsize, flags)
 }
 
 /*
@@ -128,7 +202,7 @@ func Getfsstat(buf []Statfs_t, flags int) (n int, err error) {
 //sys	Close(fd int) (err error)
 //sys	Dup(fd int) (nfd int, err error)
 //sys	Dup2(from int, to int) (err error)
-//sys	Exit(code int)
+//sys	dup3(from int, to int, flags int) (err error)
 //sys	Fchdir(fd int) (err error)
 //sys	Fchflags(fd int, flags int) (err error)
 //sys	Fchmod(fd int, mode uint32) (err error)
@@ -165,14 +239,13 @@ func Getfsstat(buf []Statfs_t, flags int) (n int, err error) {
 //sys	Nanosleep(time *Timespec, leftover *Timespec) (err error)
 //sys	Open(path string, mode int, perm uint32) (fd int, err error)
 //sys	Pathconf(path string, name int) (val int, err error)
-//sys	Pread(fd int, p []byte, offset int64) (n int, err error)
-//sys	Pwrite(fd int, p []byte, offset int64) (n int, err error)
+//sys	pread(fd int, p []byte, offset int64) (n int, err error)
+//sys	pwrite(fd int, p []byte, offset int64) (n int, err error)
 //sys	read(fd int, p []byte) (n int, err error)
 //sys	Readlink(path string, buf []byte) (n int, err error)
 //sys	Rename(from string, to string) (err error)
 //sys	Revoke(path string) (err error)
 //sys	Rmdir(path string) (err error)
-//sys	Seek(fd int, offset int64, whence int) (newoffset int64, err error) = SYS_LSEEK
 //sys	Select(n int, r *FdSet, w *FdSet, e *FdSet, timeout *Timeval) (err error)
 //sysnb	Setegid(egid int) (err error)
 //sysnb	Seteuid(euid int) (err error)
@@ -182,7 +255,7 @@ func Getfsstat(buf []Statfs_t, flags int) (n int, err error) {
 //sys	Setpriority(which int, who int, prio int) (err error)
 //sysnb	Setregid(rgid int, egid int) (err error)
 //sysnb	Setreuid(ruid int, euid int) (err error)
-//sysnb	Setrlimit(which int, lim *Rlimit) (err error)
+//sysnb	setrlimit(which int, lim *Rlimit) (err error)
 //sysnb	Setsid() (pid int, err error)
 //sysnb	Settimeofday(tp *Timeval) (err error)
 //sysnb	Setuid(uid int) (err error)
@@ -195,105 +268,19 @@ func Getfsstat(buf []Statfs_t, flags int) (n int, err error) {
 //sys	Unlink(path string) (err error)
 //sys	Unmount(path string, flags int) (err error)
 //sys	write(fd int, p []byte) (n int, err error)
+//sys	writev(fd int, iovecs []Iovec) (n uintptr, err error)
 //sys	mmap(addr uintptr, length uintptr, prot int, flag int, fd int, pos int64) (ret uintptr, err error)
 //sys	munmap(addr uintptr, length uintptr) (err error)
-//sys	readlen(fd int, buf *byte, nbuf int) (n int, err error) = SYS_READ
-//sys	writelen(fd int, buf *byte, nbuf int) (n int, err error) = SYS_WRITE
-
-/*
- * Unimplemented
- */
-// __getcwd
-// __semctl
-// __syscall
-// __sysctl
-// adjfreq
-// break
-// clock_getres
-// clock_gettime
-// clock_settime
-// closefrom
-// execve
-// faccessat
-// fchmodat
-// fchownat
-// fcntl
-// fhopen
-// fhstat
-// fhstatfs
-// fork
-// fstatat
-// futimens
-// getfh
-// getgid
-// getitimer
-// getlogin
-// getresgid
-// getresuid
-// getrtable
-// getthrid
-// ioctl
-// ktrace
-// lfs_bmapv
-// lfs_markv
-// lfs_segclean
-// lfs_segwait
-// linkat
-// mincore
-// minherit
-// mkdirat
-// mkfifoat
-// mknodat
-// mlock
-// mlockall
-// mount
-// mquery
-// msgctl
-// msgget
-// msgrcv
-// msgsnd
-// munlock
-// munlockall
-// nfssvc
-// nnpfspioctl
-// openat
-// poll
-// preadv
-// profil
-// pwritev
-// quotactl
-// readlinkat
-// readv
-// reboot
-// renameat
-// rfork
-// sched_yield
-// semget
-// semop
-// setgroups
-// setitimer
-// setresgid
-// setresuid
-// setrtable
-// setsockopt
-// shmat
-// shmctl
-// shmdt
-// shmget
-// sigaction
-// sigaltstack
-// sigpending
-// sigprocmask
-// sigreturn
-// sigsuspend
-// symlinkat
-// sysarch
-// syscall
-// threxit
-// thrsigdivert
-// thrsleep
-// thrwakeup
-// unlinkat
-// utimensat
-// vfork
-// writev
+//sys	getfsstat(stat *Statfs_t, bufsize uintptr, flags int) (n int, err error)
+//sys	utimensat(dirfd int, path string, times *[2]Timespec, flag int) (err error)
+//sys	readlen(fd int, buf *byte, nbuf int) (n int, err error) = SYS_read
+//sys	Seek(fd int, offset int64, whence int) (newoffset int64, err error) = SYS_lseek
+//sys	getcwd(buf []byte) (n int, err error)
+//sys	sysctl(mib []_C_int, old *byte, oldlen *uintptr, new *byte, newlen uintptr) (err error)
+//sysnb fork() (pid int, err error)
+//sysnb execve(path *byte, argv **byte, envp **byte) (err error)
+//sysnb exit(res int) (err error)
+//sys   ptrace(request int, pid int, addr uintptr, data uintptr) (err error)
+//sys   fstatat(fd int, path string, stat *Stat_t, flags int) (err error)
+//sys   unlinkat(fd int, path string, flags int) (err error)
+//sys   openat(fd int, path string, flags int, perm uint32) (fdret int, err error)

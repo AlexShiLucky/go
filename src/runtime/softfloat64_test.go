@@ -1,4 +1,4 @@
-// Copyright 2010 The Go Authors.  All rights reserved.
+// Copyright 2010 The Go Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
@@ -36,10 +36,12 @@ func TestFloat64(t *testing.T) {
 		math.Inf(-1),
 		0.1,
 		1.5,
-		1.9999999999999998,     // all 1s mantissa
-		1.3333333333333333,     // 1.010101010101...
-		1.1428571428571428,     // 1.001001001001...
-		1.112536929253601e-308, // first normal
+		1.9999999999999998,      // all 1s mantissa
+		1.3333333333333333,      // 1.010101010101...
+		1.1428571428571428,      // 1.001001001001...
+		1.112536929253601e-308,  // first normal
+		-2.662107816930723e-301, // #79964: two near-equal opposite-sign
+		2.662107858822336e-301,  // normals cancelling to a subnormal
 		2,
 		4,
 		8,
@@ -127,7 +129,7 @@ func fromint64sw(f float64) float64 {
 
 var nerr int
 
-func err(t *testing.T, format string, args ...interface{}) {
+func err(t *testing.T, format string, args ...any) {
 	t.Errorf(format, args...)
 
 	// cut errors off after a while.

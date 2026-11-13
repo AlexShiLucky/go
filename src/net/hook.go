@@ -4,9 +4,28 @@
 
 package net
 
+import (
+	"context"
+)
+
 var (
-	testHookDialTCP      = dialTCP
-	testHookHostsPath    = "/etc/hosts"
-	testHookLookupIP     = func(fn func(string) ([]IPAddr, error), host string) ([]IPAddr, error) { return fn(host) }
-	testHookSetKeepAlive = func() {}
+	// if non-nil, overrides dialTCP.
+	testHookDialTCP func(ctx context.Context, net string, laddr, raddr *TCPAddr) (*TCPConn, error)
+
+	testHookLookupIP = func(
+		ctx context.Context,
+		fn func(context.Context, string, string) ([]IPAddr, error),
+		network string,
+		host string,
+	) ([]IPAddr, error) {
+		return fn(ctx, network, host)
+	}
+	testPreHookSetKeepAlive = func(*netFD) {}
+	testHookSetKeepAlive    = func(KeepAliveConfig) {}
+
+	// testHookStepTime sleeps until time has moved forward by a nonzero amount.
+	// This helps to avoid flakes in timeout tests by ensuring that an implausibly
+	// short deadline (such as 1ns in the future) is always expired by the time
+	// a relevant system call occurs.
+	testHookStepTime = func() {}
 )

@@ -7,118 +7,189 @@
 package syscall
 
 import (
+	"internal/bytealg"
+	"runtime"
+	"slices"
 	"sync"
 	"unicode/utf16"
 	"unsafe"
 )
 
+// ForkLock is not used on Windows.
 var ForkLock sync.RWMutex
 
 // EscapeArg rewrites command line argument s as prescribed
-// in http://msdn.microsoft.com/en-us/library/ms880421.
+// in https://msdn.microsoft.com/en-us/library/ms880421.
 // This function returns "" (2 double quotes) if s is empty.
 // Alternatively, these transformations are done:
-// - every back slash (\) is doubled, but only if immediately
-//   followed by double quote (");
-// - every double quote (") is escaped by back slash (\);
-// - finally, s is wrapped with double quotes (arg -> "arg"),
-//   but only if there is space or tab inside s.
+//   - every back slash (\) is doubled, but only if immediately
+//     followed by double quote (");
+//   - every double quote (") is escaped by back slash (\);
+//   - finally, s is wrapped with double quotes (arg -> "arg"),
+//     but only if there is space or tab inside s.
 func EscapeArg(s string) string {
 	if len(s) == 0 {
-		return "\"\""
+		return `""`
 	}
-	n := len(s)
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"', '\\', ' ', '\t':
+			// Some escaping required.
+			b := make([]byte, 0, len(s)+2)
+			b = appendEscapeArg(b, s)
+			return string(b)
+		}
+	}
+	return s
+}
+
+// appendEscapeArg escapes the string s, as per escapeArg,
+// appends the result to b, and returns the updated slice.
+func appendEscapeArg(b []byte, s string) []byte {
+	if len(s) == 0 {
+		return append(b, `""`...)
+	}
+
+	needsBackslash := false
 	hasSpace := false
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
 		case '"', '\\':
-			n++
+			needsBackslash = true
 		case ' ', '\t':
 			hasSpace = true
 		}
 	}
-	if hasSpace {
-		n += 2
+
+	if !needsBackslash && !hasSpace {
+		// No special handling required; normal case.
+		return append(b, s...)
 	}
-	if n == len(s) {
-		return s
+	if !needsBackslash {
+		// hasSpace is true, so we need to quote the string.
+		b = append(b, '"')
+		b = append(b, s...)
+		return append(b, '"')
 	}
 
-	qs := make([]byte, n)
-	j := 0
 	if hasSpace {
-		qs[j] = '"'
-		j++
+		b = append(b, '"')
 	}
 	slashes := 0
 	for i := 0; i < len(s); i++ {
-		switch s[i] {
+		c := s[i]
+		switch c {
 		default:
 			slashes = 0
-			qs[j] = s[i]
 		case '\\':
 			slashes++
-			qs[j] = s[i]
 		case '"':
 			for ; slashes > 0; slashes-- {
-				qs[j] = '\\'
-				j++
+				b = append(b, '\\')
 			}
-			qs[j] = '\\'
-			j++
-			qs[j] = s[i]
+			b = append(b, '\\')
 		}
-		j++
+		b = append(b, c)
 	}
 	if hasSpace {
 		for ; slashes > 0; slashes-- {
-			qs[j] = '\\'
-			j++
+			b = append(b, '\\')
 		}
-		qs[j] = '"'
-		j++
+		b = append(b, '"')
 	}
-	return string(qs[:j])
+
+	return b
 }
 
 // makeCmdLine builds a command line out of args by escaping "special"
 // characters and joining the arguments with spaces.
 func makeCmdLine(args []string) string {
-	var s string
+	var b []byte
 	for _, v := range args {
-		if s != "" {
-			s += " "
+		if len(b) > 0 {
+			b = append(b, ' ')
 		}
-		s += EscapeArg(v)
+		b = appendEscapeArg(b, v)
 	}
-	return s
+	return string(b)
+}
+
+func envSorted(envv []string) []string {
+	if len(envv) < 2 {
+		return envv
+	}
+
+	lowerKeyCache := map[string][]byte{} // lowercased keys to avoid recomputing them in sort
+	lowerKey := func(kv string) []byte {
+		eq := bytealg.IndexByteString(kv, '=')
+		if eq < 0 {
+			return nil
+		}
+		k := kv[:eq]
+		v, ok := lowerKeyCache[k]
+		if !ok {
+			v = []byte(k)
+			for i, b := range v {
+				// We only normalize ASCII for now.
+				// In practice, all environment variables are ASCII, and the
+				// syscall package can't import "unicode" anyway.
+				// Also, per https://nullprogram.com/blog/2023/08/23/ the
+				// sorting of environment variables doesn't really matter.
+				// TODO(bradfitz): use RtlCompareUnicodeString instead,
+				// per that blog post? For now, ASCII is good enough.
+				if 'a' <= b && b <= 'z' {
+					v[i] -= 'a' - 'A'
+				}
+			}
+			lowerKeyCache[k] = v
+		}
+		return v
+	}
+
+	cmpEnv := func(a, b string) int {
+		return bytealg.Compare(lowerKey(a), lowerKey(b))
+	}
+
+	if !slices.IsSortedFunc(envv, cmpEnv) {
+		envv = slices.Clone(envv)
+		slices.SortFunc(envv, cmpEnv)
+	}
+	return envv
 }
 
 // createEnvBlock converts an array of environment strings into
 // the representation required by CreateProcess: a sequence of NUL
 // terminated strings followed by a nil.
 // Last bytes are two UCS-2 NULs, or four NUL bytes.
-func createEnvBlock(envv []string) *uint16 {
+// If any string contains a NUL, it returns (nil, EINVAL).
+func createEnvBlock(envv []string) ([]uint16, error) {
 	if len(envv) == 0 {
-		return &utf16.Encode([]rune("\x00\x00"))[0]
+		return utf16.Encode([]rune("\x00\x00")), nil
 	}
-	length := 0
+
+	// https://learn.microsoft.com/en-us/windows/win32/procthread/changing-environment-variables
+	// says that: "All strings in the environment block must be sorted
+	// alphabetically by name."
+	envv = envSorted(envv)
+
+	var length int
 	for _, s := range envv {
+		if bytealg.IndexByteString(s, 0) != -1 {
+			return nil, EINVAL
+		}
 		length += len(s) + 1
 	}
 	length += 1
 
-	b := make([]byte, length)
-	i := 0
+	b := make([]uint16, 0, length)
 	for _, s := range envv {
-		l := len(s)
-		copy(b[i:i+l], []byte(s))
-		copy(b[i+l:i+l+1], []byte{0})
-		i = i + l + 1
+		for _, c := range s {
+			b = utf16.AppendRune(b, c)
+		}
+		b = utf16.AppendRune(b, 0)
 	}
-	copy(b[i:i+1], []byte{0})
-
-	return &utf16.Encode([]rune(string(b)))[0]
+	b = utf16.AppendRune(b, 0)
+	return b, nil
 }
 
 func CloseOnExec(fd Handle) {
@@ -209,8 +280,6 @@ func joinExeDirAndFName(dir, p string) (name string, err error) {
 			return FullPath(d + "\\" + p)
 		}
 	}
-	// we shouldn't be here
-	return "", EINVAL
 }
 
 type ProcAttr struct {
@@ -221,9 +290,15 @@ type ProcAttr struct {
 }
 
 type SysProcAttr struct {
-	HideWindow    bool
-	CmdLine       string // used if non-empty, else the windows command line is built by escaping the arguments passed to StartProcess
-	CreationFlags uint32
+	HideWindow                 bool
+	CmdLine                    string // used if non-empty, else the windows command line is built by escaping the arguments passed to StartProcess
+	CreationFlags              uint32
+	Token                      Token               // if set, runs new process in the security context represented by the token
+	ProcessAttributes          *SecurityAttributes // if set, applies these security attributes as the descriptor for the new process
+	ThreadAttributes           *SecurityAttributes // if set, applies these security attributes as the descriptor for the main thread of the new process
+	NoInheritHandles           bool                // if set, no handles are inherited by the new process, not even the standard handles, contained in ProcAttr.Files, nor the ones contained in AdditionalInheritedHandles
+	AdditionalInheritedHandles []Handle            // a list of additional handles, already marked as inheritable, that will be inherited by the new process
+	ParentProcess              Handle              // if non-zero, the new process regards the process given by this handle as its parent process, and AdditionalInheritedHandles, if set, should exist in this parent process
 }
 
 var zeroProcAttr ProcAttr
@@ -261,9 +336,35 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 			return 0, 0, err
 		}
 	}
-	argv0p, err := UTF16PtrFromString(argv0)
-	if err != nil {
-		return 0, 0, err
+	var argv0p *uint16
+	isBat := false
+	if sys.CmdLine == "" && hasBatchExtension(argv0) {
+		resolved, err := FullPath(argv0)
+		if err != nil {
+			return 0, 0, err
+		}
+		// Avoid rewriting argv[0] if the resolved path contains '%' or '!',
+		// which cmd.exe could expand as environment variables. Also check
+		// GetBinaryTypeW to ensure the file is not an executable binary
+		// with a .bat or .cmd extension.
+		if bytealg.IndexByteString(resolved, '%') == -1 && bytealg.IndexByteString(resolved, '!') == -1 {
+			resolvedp, err := UTF16PtrFromString(resolved)
+			if err != nil {
+				return 0, 0, err
+			}
+			var binaryType uint32
+			if getBinaryType(resolvedp, &binaryType) == _ERROR_BAD_EXE_FORMAT {
+				isBat = true
+				argv0 = resolved
+				argv0p = resolvedp
+			}
+		}
+	}
+	if argv0p == nil {
+		argv0p, err = UTF16PtrFromString(argv0)
+		if err != nil {
+			return 0, 0, err
+		}
 	}
 
 	var cmdline string
@@ -272,6 +373,34 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 	// and joining each argument with spaces
 	if sys.CmdLine != "" {
 		cmdline = sys.CmdLine
+	} else if isBat {
+		// For .bat and .cmd files, Windows CreateProcess implicitly invokes
+		// cmd.exe /c <cmdline>, ignoring lpApplicationName (argv0) when
+		// resolving the script to execute. Replace argv[0] with argv0 so
+		// cmd.exe runs the resolved script rather than re-resolving argv[0]
+		// against Dir and PATH.
+		//
+		// We wrap argv0 in quotes (in case it contains spaces or cmd.exe
+		// metacharacters like '&' or '()') and wrap the entire command line
+		// in an outer pair of quotes. When cmd.exe processes /c without /s,
+		// if the command line starts with a quote and contains more than two
+		// quotes, cmd.exe strips the first and last quote characters on the
+		// command line, leaving `"argv0" args...` intact.
+		if bytealg.IndexByteString(argv0, '"') != -1 {
+			return 0, 0, EINVAL
+		}
+		var b []byte
+		b = append(b, '"', '"')
+		b = append(b, argv0...)
+		b = append(b, '"')
+		if len(argv) > 1 {
+			for _, v := range argv[1:] {
+				b = append(b, ' ')
+				b = appendEscapeArg(b, v)
+			}
+		}
+		b = append(b, '"')
+		cmdline = string(b)
 	} else {
 		cmdline = makeCmdLine(argv)
 	}
@@ -292,44 +421,119 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 		}
 	}
 
-	// Acquire the fork lock so that no other threads
-	// create new fds that are not yet close-on-exec
-	// before we fork.
-	ForkLock.Lock()
-	defer ForkLock.Unlock()
-
 	p, _ := GetCurrentProcess()
+	parentProcess := p
+	if sys.ParentProcess != 0 {
+		parentProcess = sys.ParentProcess
+	}
 	fd := make([]Handle, len(attr.Files))
 	for i := range attr.Files {
 		if attr.Files[i] > 0 {
-			err := DuplicateHandle(p, Handle(attr.Files[i]), p, &fd[i], 0, true, DUPLICATE_SAME_ACCESS)
+			err := DuplicateHandle(p, Handle(attr.Files[i]), parentProcess, &fd[i], 0, true, DUPLICATE_SAME_ACCESS)
 			if err != nil {
 				return 0, 0, err
 			}
-			defer CloseHandle(Handle(fd[i]))
+			defer DuplicateHandle(parentProcess, fd[i], 0, nil, 0, false, DUPLICATE_CLOSE_SOURCE)
 		}
 	}
-	si := new(StartupInfo)
+	procAttrList, err := newProcThreadAttributeList(2)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer procAttrList.delete()
+	si := new(_STARTUPINFOEXW)
 	si.Cb = uint32(unsafe.Sizeof(*si))
 	si.Flags = STARTF_USESTDHANDLES
 	if sys.HideWindow {
 		si.Flags |= STARTF_USESHOWWINDOW
 		si.ShowWindow = SW_HIDE
 	}
+	if sys.ParentProcess != 0 {
+		err = procAttrList.update(_PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, unsafe.Pointer(&sys.ParentProcess), unsafe.Sizeof(sys.ParentProcess))
+		if err != nil {
+			return 0, 0, err
+		}
+	}
 	si.StdInput = fd[0]
 	si.StdOutput = fd[1]
 	si.StdErr = fd[2]
 
-	pi := new(ProcessInformation)
+	fd = append(fd, sys.AdditionalInheritedHandles...)
 
-	flags := sys.CreationFlags | CREATE_UNICODE_ENVIRONMENT
-	err = CreateProcess(argv0p, argvp, nil, nil, true, flags, createEnvBlock(attr.Env), dirp, si, pi)
+	// The presence of a NULL handle in the list is enough to cause PROC_THREAD_ATTRIBUTE_HANDLE_LIST
+	// to treat the entire list as empty, so remove NULL handles.
+	j := 0
+	for i := range fd {
+		if fd[i] != 0 {
+			fd[j] = fd[i]
+			j++
+		}
+	}
+	fd = fd[:j]
+
+	willInheritHandles := len(fd) > 0 && !sys.NoInheritHandles
+
+	// Do not accidentally inherit more than these handles.
+	if willInheritHandles {
+		err = procAttrList.update(_PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&fd[0]), uintptr(len(fd))*unsafe.Sizeof(fd[0]))
+		if err != nil {
+			return 0, 0, err
+		}
+	}
+
+	envBlock, err := createEnvBlock(attr.Env)
+	if err != nil {
+		return 0, 0, err
+	}
+
+	si.ProcThreadAttributeList = procAttrList.list()
+	pi := new(ProcessInformation)
+	flags := sys.CreationFlags | CREATE_UNICODE_ENVIRONMENT | _EXTENDED_STARTUPINFO_PRESENT
+	if sys.Token != 0 {
+		err = CreateProcessAsUser(sys.Token, argv0p, argvp, sys.ProcessAttributes, sys.ThreadAttributes, willInheritHandles, flags, &envBlock[0], dirp, &si.StartupInfo, pi)
+	} else {
+		err = CreateProcess(argv0p, argvp, sys.ProcessAttributes, sys.ThreadAttributes, willInheritHandles, flags, &envBlock[0], dirp, &si.StartupInfo, pi)
+	}
 	if err != nil {
 		return 0, 0, err
 	}
 	defer CloseHandle(Handle(pi.Thread))
+	runtime.KeepAlive(fd)
+	runtime.KeepAlive(sys)
 
 	return int(pi.ProcessId), uintptr(pi.Process), nil
+}
+
+// hasBatchExtension reports whether path has a .bat or .cmd extension
+// (ignoring any trailing spaces or dots, which Windows strips).
+func hasBatchExtension(path string) bool {
+	for len(path) > 0 && (path[len(path)-1] == ' ' || path[len(path)-1] == '.') {
+		path = path[:len(path)-1]
+	}
+	if len(path) < 4 {
+		return false
+	}
+	ext := path[len(path)-4:]
+	return asciiEqualFold(ext, ".bat") || asciiEqualFold(ext, ".cmd")
+}
+
+func asciiEqualFold(s, t string) bool {
+	if len(s) != len(t) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if asciiLower(s[i]) != asciiLower(t[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func asciiLower(b byte) byte {
+	if 'A' <= b && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
 }
 
 func Exec(argv0 string, argv []string, envv []string) (err error) {

@@ -5,8 +5,12 @@
 package net
 
 import (
+	"bytes"
+	"encoding/json"
+	"math/rand"
 	"reflect"
 	"runtime"
+	"slices"
 	"testing"
 )
 
@@ -16,24 +20,34 @@ var parseIPTests = []struct {
 }{
 	{"127.0.1.2", IPv4(127, 0, 1, 2)},
 	{"127.0.0.1", IPv4(127, 0, 0, 1)},
-	{"127.001.002.003", IPv4(127, 1, 2, 3)},
 	{"::ffff:127.1.2.3", IPv4(127, 1, 2, 3)},
-	{"::ffff:127.001.002.003", IPv4(127, 1, 2, 3)},
 	{"::ffff:7f01:0203", IPv4(127, 1, 2, 3)},
 	{"0:0:0:0:0000:ffff:127.1.2.3", IPv4(127, 1, 2, 3)},
-	{"0:0:0:0:000000:ffff:127.1.2.3", IPv4(127, 1, 2, 3)},
 	{"0:0:0:0::ffff:127.1.2.3", IPv4(127, 1, 2, 3)},
 
 	{"2001:4860:0:2001::68", IP{0x20, 0x01, 0x48, 0x60, 0, 0, 0x20, 0x01, 0, 0, 0, 0, 0, 0, 0x00, 0x68}},
 	{"2001:4860:0000:2001:0000:0000:0000:0068", IP{0x20, 0x01, 0x48, 0x60, 0, 0, 0x20, 0x01, 0, 0, 0, 0, 0, 0, 0x00, 0x68}},
 
+	{"-0.0.0.0", nil},
+	{"0.-1.0.0", nil},
+	{"0.0.-2.0", nil},
+	{"0.0.0.-3", nil},
 	{"127.0.0.256", nil},
 	{"abc", nil},
 	{"123:", nil},
 	{"fe80::1%lo0", nil},
 	{"fe80::1%911", nil},
 	{"", nil},
+	//6 zeroes in one group
+	{"0:0:0:0:000000:ffff:127.1.2.3", nil},
+	//5 zeroes in one group edge case
+	{"0:0:0:0:00000:ffff:127.1.2.3", nil},
 	{"a1:a2:a3:a4::b1:b2:b3:b4", nil}, // Issue 6628
+	{"127.001.002.003", nil},
+	{"::ffff:127.001.002.003", nil},
+	{"123.000.000.000", nil},
+	{"1.2..4", nil},
+	{"0123.0.0.1", nil},
 }
 
 func TestParseIP(t *testing.T) {
@@ -105,6 +119,22 @@ func BenchmarkParseIP(b *testing.B) {
 	}
 }
 
+func BenchmarkParseIPValidIPv4(b *testing.B) {
+	testHookUninstaller.Do(uninstallTestHooks)
+
+	for i := 0; i < b.N; i++ {
+		ParseIP("192.0.2.1")
+	}
+}
+
+func BenchmarkParseIPValidIPv6(b *testing.B) {
+	testHookUninstaller.Do(uninstallTestHooks)
+
+	for i := 0; i < b.N; i++ {
+		ParseIP("2001:DB8::1")
+	}
+}
+
 // Issue 6339
 func TestMarshalEmptyIP(t *testing.T) {
 	for _, in := range [][]byte{nil, []byte("")} {
@@ -121,44 +151,201 @@ func TestMarshalEmptyIP(t *testing.T) {
 	if !reflect.DeepEqual(got, []byte("")) {
 		t.Errorf(`got %#v, want []byte("")`, got)
 	}
+
+	buf := make([]byte, 4)
+	got, err = ip.AppendText(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []byte("\x00\x00\x00\x00")) {
+		t.Errorf(`got %#v, want []byte("\x00\x00\x00\x00")`, got)
+	}
 }
 
-var ipStringTests = []struct {
-	in  IP
-	out string // see RFC 5952
+var ipStringTests = []*struct {
+	in  IP     // see RFC 791 and RFC 4291
+	str string // see RFC 791, RFC 4291 and RFC 5952
+	byt []byte
+	error
 }{
-	{IP{0x20, 0x1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0x1, 0x23, 0, 0x12, 0, 0x1}, "2001:db8::123:12:1"},
-	{IP{0x20, 0x1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1}, "2001:db8::1"},
-	{IP{0x20, 0x1, 0xd, 0xb8, 0, 0, 0, 0x1, 0, 0, 0, 0x1, 0, 0, 0, 0x1}, "2001:db8:0:1:0:1:0:1"},
-	{IP{0x20, 0x1, 0xd, 0xb8, 0, 0x1, 0, 0, 0, 0x1, 0, 0, 0, 0x1, 0, 0}, "2001:db8:1:0:1:0:1:0"},
-	{IP{0x20, 0x1, 0, 0, 0, 0, 0, 0, 0, 0x1, 0, 0, 0, 0, 0, 0x1}, "2001::1:0:0:1"},
-	{IP{0x20, 0x1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0x1, 0, 0, 0, 0, 0, 0}, "2001:db8:0:0:1::"},
-	{IP{0x20, 0x1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0x1, 0, 0, 0, 0, 0, 0x1}, "2001:db8::1:0:0:1"},
-	{IP{0x20, 0x1, 0xD, 0xB8, 0, 0, 0, 0, 0, 0xA, 0, 0xB, 0, 0xC, 0, 0xD}, "2001:db8::a:b:c:d"},
-	{IPv4(192, 168, 0, 1), "192.168.0.1"},
-	{nil, ""},
+	// IPv4 address
+	{
+		IP{192, 0, 2, 1},
+		"192.0.2.1",
+		[]byte("192.0.2.1"),
+		nil,
+	},
+	{
+		IP{0, 0, 0, 0},
+		"0.0.0.0",
+		[]byte("0.0.0.0"),
+		nil,
+	},
+
+	// IPv4-mapped IPv6 address
+	{
+		IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 1},
+		"192.0.2.1",
+		[]byte("192.0.2.1"),
+		nil,
+	},
+	{
+		IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 0, 0},
+		"0.0.0.0",
+		[]byte("0.0.0.0"),
+		nil,
+	},
+
+	// IPv6 address
+	{
+		IP{0x20, 0x1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0x1, 0x23, 0, 0x12, 0, 0x1},
+		"2001:db8::123:12:1",
+		[]byte("2001:db8::123:12:1"),
+		nil,
+	},
+	{
+		IP{0x20, 0x1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x1},
+		"2001:db8::1",
+		[]byte("2001:db8::1"),
+		nil,
+	},
+	{
+		IP{0x20, 0x1, 0xd, 0xb8, 0, 0, 0, 0x1, 0, 0, 0, 0x1, 0, 0, 0, 0x1},
+		"2001:db8:0:1:0:1:0:1",
+		[]byte("2001:db8:0:1:0:1:0:1"),
+		nil,
+	},
+	{
+		IP{0x20, 0x1, 0xd, 0xb8, 0, 0x1, 0, 0, 0, 0x1, 0, 0, 0, 0x1, 0, 0},
+		"2001:db8:1:0:1:0:1:0",
+		[]byte("2001:db8:1:0:1:0:1:0"),
+		nil,
+	},
+	{
+		IP{0x20, 0x1, 0, 0, 0, 0, 0, 0, 0, 0x1, 0, 0, 0, 0, 0, 0x1},
+		"2001::1:0:0:1",
+		[]byte("2001::1:0:0:1"),
+		nil,
+	},
+	{
+		IP{0x20, 0x1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0x1, 0, 0, 0, 0, 0, 0},
+		"2001:db8:0:0:1::",
+		[]byte("2001:db8:0:0:1::"),
+		nil,
+	},
+	{
+		IP{0x20, 0x1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0x1, 0, 0, 0, 0, 0, 0x1},
+		"2001:db8::1:0:0:1",
+		[]byte("2001:db8::1:0:0:1"),
+		nil,
+	},
+	{
+		IP{0x20, 0x1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0xa, 0, 0xb, 0, 0xc, 0, 0xd},
+		"2001:db8::a:b:c:d",
+		[]byte("2001:db8::a:b:c:d"),
+		nil,
+	},
+	{
+		IPv6unspecified,
+		"::",
+		[]byte("::"),
+		nil,
+	},
+
+	// IP wildcard equivalent address in Dial/Listen API
+	{
+		nil,
+		"<nil>",
+		nil,
+		nil,
+	},
+
+	// Opaque byte sequence
+	{
+		IP{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef},
+		"?0123456789abcdef",
+		nil,
+		&AddrError{Err: "invalid IP address", Addr: "0123456789abcdef"},
+	},
 }
 
 func TestIPString(t *testing.T) {
 	for _, tt := range ipStringTests {
-		if tt.in != nil {
-			if out := tt.in.String(); out != tt.out {
-				t.Errorf("IP.String(%v) = %q, want %q", tt.in, out, tt.out)
-			}
+		if out := tt.in.String(); out != tt.str {
+			t.Errorf("IP.String(%v) = %q, want %q", tt.in, out, tt.str)
 		}
-		if out, err := tt.in.MarshalText(); string(out) != tt.out || err != nil {
-			t.Errorf("IP.MarshalText(%v) = %q, %v, want %q, nil", tt.in, out, err, tt.out)
+		if out, err := tt.in.MarshalText(); !bytes.Equal(out, tt.byt) || !reflect.DeepEqual(err, tt.error) {
+			t.Errorf("IP.MarshalText(%v) = %v, %v, want %v, %v", tt.in, out, err, tt.byt, tt.error)
+		}
+		buf := make([]byte, 4, 32)
+		if out, err := tt.in.AppendText(buf); !bytes.Equal(out[4:], tt.byt) || !reflect.DeepEqual(err, tt.error) {
+			t.Errorf("IP.AppendText(%v) = %v, %v, want %v, %v", tt.in, out[4:], err, tt.byt, tt.error)
 		}
 	}
 }
 
+func TestIPAppendTextNoAllocs(t *testing.T) {
+	// except the invalid IP
+	for _, tt := range ipStringTests[:len(ipStringTests)-1] {
+		allocs := int(testing.AllocsPerRun(1000, func() {
+			buf := make([]byte, 0, 64)
+			_, _ = tt.in.AppendText(buf)
+		}))
+		if allocs != 0 {
+			t.Errorf("IP(%q) AppendText allocs: %d times, want 0", tt.in, allocs)
+		}
+	}
+}
+
+func BenchmarkIPMarshalText(b *testing.B) {
+	b.Run("IPv4", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		ip := IP{192, 0, 2, 1}
+		for range b.N {
+			_, _ = ip.MarshalText()
+		}
+	})
+	b.Run("IPv6", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		ip := IP{0x20, 0x1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0xa, 0, 0xb, 0, 0xc, 0, 0xd}
+		for range b.N {
+			_, _ = ip.MarshalText()
+		}
+	})
+	b.Run("IPv6_long", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		// fd7a:115c:a1e0:ab12:4843:cd96:626b:430b
+		ip := IP{253, 122, 17, 92, 161, 224, 171, 18, 72, 67, 205, 150, 98, 107, 67, 11}
+		for range b.N {
+			_, _ = ip.MarshalText()
+		}
+	})
+}
+
+var sink string
+
 func BenchmarkIPString(b *testing.B) {
 	testHookUninstaller.Do(uninstallTestHooks)
 
+	b.Run("IPv4", func(b *testing.B) {
+		benchmarkIPString(b, IPv4len)
+	})
+
+	b.Run("IPv6", func(b *testing.B) {
+		benchmarkIPString(b, IPv6len)
+	})
+}
+
+func benchmarkIPString(b *testing.B, size int) {
+	b.ReportAllocs()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		for _, tt := range ipStringTests {
-			if tt.in != nil {
-				tt.in.String()
+			if tt.in != nil && len(tt.in) == size {
+				sink = tt.in.String()
 			}
 		}
 	}
@@ -204,12 +391,108 @@ func TestIPMaskString(t *testing.T) {
 	}
 }
 
+var ipMaskJSONTests = []struct {
+	in   IPMask
+	out0 string // expected marshaling with GODEBUG=netmarshal=0
+	out1 string // expected marshaling with GODEBUG=netmarshal=1
+}{
+	{
+		nil,
+		`""`,
+		`""`,
+	},
+	{
+		IPv4Mask(255, 255, 255, 0),
+		`"////AA=="`,
+		`"255.255.255.0"`,
+	},
+	{
+		IPMask(ParseIP("ffff:ff80::")),
+		`"////gAAAAAAAAAAAAAAAAA=="`,
+		`"ffff:ff80::"`,
+	},
+	{
+		// Invalid values are base64 encoded.
+		IPMask{255, 255, 255, 0, 1},
+		`"////AAE="`,
+		`"////AAE="`,
+	},
+}
+
+func TestIPMaskJSON(t *testing.T) {
+	// testReadable tests that we can marshal m and unmarshal the result.
+	// We will call this with different GODEBUG settings to make
+	// sure that the unmarshaler, which doesn't check GODEBUG,
+	// works in all scenarios.
+	testReadable := func(m IPMask) {
+		b, err := json.Marshal(m)
+		if err != nil {
+			t.Errorf("json.Marshal(%s) failed: %v", m, err)
+			return
+		}
+
+		var m2 IPMask
+		if err = json.Unmarshal(b, &m2); err != nil {
+			t.Errorf("json.Unmarshal of %q (from %s) failed: %v", b, m, err)
+			return
+		}
+
+		if !slices.Equal(m, m2) {
+			t.Errorf("%s marshaled to %q, unmarshaled to different value %s", m, b, m2)
+		}
+	}
+
+	for _, d := range []string{"unset", "0", "1"} {
+		t.Run("GODEBUG="+d, func(t *testing.T) {
+			if d != "unset" {
+				t.Setenv("GODEBUG", "netmarshal="+d)
+
+				for _, tt := range ipMaskJSONTests {
+					b, err := json.Marshal(tt.in)
+					if err != nil {
+						t.Errorf("json.Marshal(%s) failed: %v", tt.in, err)
+						continue
+					}
+					var want string
+					if d == "0" {
+						want = tt.out0
+					} else {
+						want = tt.out1
+					}
+					if string(b) != want {
+						t.Errorf("json.Marshal(%s) = %q, want %q", tt.in, b, want)
+					}
+				}
+			}
+
+			testReadable(nil)
+			testReadable(classAMask)
+			testReadable(classBMask)
+			testReadable(classCMask)
+
+			for _, tt := range ipMaskTests {
+				testReadable(tt.mask)
+			}
+
+			for _, tt := range ipMaskStringTests {
+				testReadable(tt.in)
+			}
+
+			// Historically we have permitted an invalid
+			// IPMask to round trip through JSON encoding.
+			// Test that that is the case.
+			// Issue 81749.
+			testReadable(IPMask{255, 255, 255, 0, 1})
+		})
+	}
+}
+
 func BenchmarkIPMaskString(b *testing.B) {
 	testHookUninstaller.Do(uninstallTestHooks)
 
 	for i := 0; i < b.N; i++ {
 		for _, tt := range ipMaskStringTests {
-			tt.in.String()
+			sink = tt.in.String()
 		}
 	}
 }
@@ -240,6 +523,13 @@ var parseCIDRTests = []struct {
 	{"192.168.1.1/255.255.255.0", nil, nil, &ParseError{Type: "CIDR address", Text: "192.168.1.1/255.255.255.0"}},
 	{"192.168.1.1/35", nil, nil, &ParseError{Type: "CIDR address", Text: "192.168.1.1/35"}},
 	{"2001:db8::1/-1", nil, nil, &ParseError{Type: "CIDR address", Text: "2001:db8::1/-1"}},
+	{"2001:db8::1/-0", nil, nil, &ParseError{Type: "CIDR address", Text: "2001:db8::1/-0"}},
+	{"-0.0.0.0/32", nil, nil, &ParseError{Type: "CIDR address", Text: "-0.0.0.0/32"}},
+	{"0.-1.0.0/32", nil, nil, &ParseError{Type: "CIDR address", Text: "0.-1.0.0/32"}},
+	{"0.0.-2.0/32", nil, nil, &ParseError{Type: "CIDR address", Text: "0.0.-2.0/32"}},
+	{"0.0.0.-3/32", nil, nil, &ParseError{Type: "CIDR address", Text: "0.0.0.-3/32"}},
+	{"0.0.0.0/-0", nil, nil, &ParseError{Type: "CIDR address", Text: "0.0.0.0/-0"}},
+	{"127.000.000.001/32", nil, nil, &ParseError{Type: "CIDR address", Text: "127.000.000.001/32"}},
 	{"", nil, nil, &ParseError{Type: "CIDR address", Text: ""}},
 }
 
@@ -286,6 +576,7 @@ var ipNetStringTests = []struct {
 	{&IPNet{IP: IPv4(192, 168, 1, 0), Mask: IPv4Mask(255, 0, 255, 0)}, "192.168.1.0/ff00ff00"},
 	{&IPNet{IP: ParseIP("2001:db8::"), Mask: CIDRMask(55, 128)}, "2001:db8::/55"},
 	{&IPNet{IP: ParseIP("2001:db8::"), Mask: IPMask(ParseIP("8000:f123:0:cafe::"))}, "2001:db8::/8000f1230000cafe0000000000000000"},
+	{nil, "<nil>"},
 }
 
 func TestIPNetString(t *testing.T) {
@@ -366,76 +657,216 @@ func TestNetworkNumberAndMask(t *testing.T) {
 	}
 }
 
-var splitJoinTests = []struct {
-	host string
-	port string
-	join string
+var ipNetJSONTests = []struct {
+	in   IPNet
+	out0 string // expected marshaling with GODEBUG=netmarshal=0
+	out1 string // expected marshaling with GODEBUG=netmarshal=1
 }{
-	{"www.google.com", "80", "www.google.com:80"},
-	{"127.0.0.1", "1234", "127.0.0.1:1234"},
-	{"::1", "80", "[::1]:80"},
-	{"fe80::1%lo0", "80", "[fe80::1%lo0]:80"},
-	{"localhost%lo0", "80", "[localhost%lo0]:80"},
-	{"", "0", ":0"},
-
-	{"google.com", "https%foo", "google.com:https%foo"}, // Go 1.0 behavior
-	{"127.0.0.1", "", "127.0.0.1:"},                     // Go 1.0 behaviour
-	{"www.google.com", "", "www.google.com:"},           // Go 1.0 behaviour
+	{
+		IPNet{IP: IPv4(0, 0, 0, 0), Mask: IPv4Mask(255, 255, 255, 0)},
+		`{"IP":"0.0.0.0","Mask":"////AA=="}`,
+		`{"IP":"0.0.0.0","Mask":"255.255.255.0"}`,
+	},
+	{
+		IPNet{IP: IPv4(172, 16, 0, 0), Mask: CIDRMask(12, 32)},
+		`{"IP":"172.16.0.0","Mask":"//AAAA=="}`,
+		`{"IP":"172.16.0.0","Mask":"255.240.0.0"}`,
+	},
+	{
+		IPNet{IP: ParseIP("2001:db8:1::"), Mask: CIDRMask(47, 128)},
+		`{"IP":"2001:db8:1::","Mask":"///////+AAAAAAAAAAAAAA=="}`,
+		`{"IP":"2001:db8:1::","Mask":"ffff:ffff:fffe::"}`,
+	},
 }
 
-var splitFailureTests = []struct {
-	hostPort string
-	err      string
-}{
-	{"www.google.com", "missing port in address"},
-	{"127.0.0.1", "missing port in address"},
-	{"[::1]", "missing port in address"},
-	{"[fe80::1%lo0]", "missing port in address"},
-	{"[localhost%lo0]", "missing port in address"},
-	{"localhost%lo0", "missing port in address"},
+func TestIPNetJSON(t *testing.T) {
+	// testReadable tests that we can marshal n and unmarshal the result.
+	// We will call this with different GODEBUG settings to make
+	// sure that the unmarshaler, which doesn't check GODEBUG,
+	// works in all scenarios.
+	testReadable := func(n *IPNet) {
+		b, err := json.Marshal(n)
+		if err != nil {
+			t.Errorf("json.Marshal(%s) failed: %v", n, err)
+			return
+		}
 
-	{"::1", "too many colons in address"},
-	{"fe80::1%lo0", "too many colons in address"},
-	{"fe80::1%lo0:80", "too many colons in address"},
+		var n2 IPNet
+		if err = json.Unmarshal(b, &n2); err != nil {
+			t.Errorf("json.Unmarshal of %q (from %s) failed: %v", b, n, err)
+			return
+		}
 
-	{"localhost%lo0:80", "missing brackets in address"},
+		var equal bool
+		if n == nil {
+			equal = len(n2.IP) == 0 && len(n2.Mask) == 0
+		} else {
+			equal = n.IP.Equal(n2.IP) && slices.Equal(n.Mask, n2.Mask)
+		}
+		if !equal {
+			t.Errorf("%s marshaled to %q, unmarshaled to different value %s", n, b, n2)
+		}
+	}
 
-	// Test cases that didn't fail in Go 1.0
+	for _, d := range []string{"unset", "0", "1"} {
+		t.Run("GODEBUG="+d, func(t *testing.T) {
+			if d != "unset" {
+				t.Setenv("GODEBUG", "netmarshal="+d)
 
-	{"[foo:bar]", "missing port in address"},
-	{"[foo:bar]baz", "missing port in address"},
-	{"[foo]bar:baz", "missing port in address"},
+				for _, tt := range ipNetJSONTests {
+					b, err := json.Marshal(tt.in)
+					if err != nil {
+						t.Errorf("json.Marshal(%s) failed: %v", tt.in, err)
+						continue
+					}
+					var want string
+					if d == "0" {
+						want = tt.out0
+					} else {
+						want = tt.out1
+					}
+					if string(b) != want {
+						t.Errorf("json.Marshal(%s) = %q, want %q", tt.in, b, want)
+					}
+				}
+			}
 
-	{"[foo]:[bar]:baz", "too many colons in address"},
-
-	{"[foo]:[bar]baz", "unexpected '[' in address"},
-	{"foo[bar]:baz", "unexpected '[' in address"},
-
-	{"foo]bar:baz", "unexpected ']' in address"},
+			for _, tt := range parseCIDRTests {
+				testReadable(tt.net)
+			}
+			for _, tt := range ipNetContainsTests {
+				testReadable(tt.net)
+			}
+			for _, tt := range ipNetStringTests {
+				testReadable(tt.in)
+			}
+		})
+	}
 }
 
 func TestSplitHostPort(t *testing.T) {
-	for _, tt := range splitJoinTests {
-		if host, port, err := SplitHostPort(tt.join); host != tt.host || port != tt.port || err != nil {
-			t.Errorf("SplitHostPort(%q) = %q, %q, %v; want %q, %q, nil", tt.join, host, port, err, tt.host, tt.port)
+	for _, tt := range []struct {
+		hostPort string
+		host     string
+		port     string
+	}{
+		// Host name
+		{"localhost:http", "localhost", "http"},
+		{"localhost:80", "localhost", "80"},
+
+		// Go-specific host name with zone identifier
+		{"localhost%lo0:http", "localhost%lo0", "http"},
+		{"localhost%lo0:80", "localhost%lo0", "80"},
+		{"[localhost%lo0]:http", "localhost%lo0", "http"}, // Go 1 behavior
+		{"[localhost%lo0]:80", "localhost%lo0", "80"},     // Go 1 behavior
+
+		// IP literal
+		{"127.0.0.1:http", "127.0.0.1", "http"},
+		{"127.0.0.1:80", "127.0.0.1", "80"},
+		{"[::1]:http", "::1", "http"},
+		{"[::1]:80", "::1", "80"},
+
+		// IP literal with zone identifier
+		{"[::1%lo0]:http", "::1%lo0", "http"},
+		{"[::1%lo0]:80", "::1%lo0", "80"},
+
+		// Go-specific wildcard for host name
+		{":http", "", "http"}, // Go 1 behavior
+		{":80", "", "80"},     // Go 1 behavior
+
+		// Go-specific wildcard for service name or transport port number
+		{"golang.org:", "golang.org", ""}, // Go 1 behavior
+		{"127.0.0.1:", "127.0.0.1", ""},   // Go 1 behavior
+		{"[::1]:", "::1", ""},             // Go 1 behavior
+
+		// Opaque service name
+		{"golang.org:https%foo", "golang.org", "https%foo"}, // Go 1 behavior
+	} {
+		if host, port, err := SplitHostPort(tt.hostPort); host != tt.host || port != tt.port || err != nil {
+			t.Errorf("SplitHostPort(%q) = %q, %q, %v; want %q, %q, nil", tt.hostPort, host, port, err, tt.host, tt.port)
 		}
 	}
-	for _, tt := range splitFailureTests {
-		if _, _, err := SplitHostPort(tt.hostPort); err == nil {
+
+	for _, tt := range []struct {
+		hostPort string
+		err      string
+	}{
+		{"golang.org", "missing port in address"},
+		{"127.0.0.1", "missing port in address"},
+		{"[::1]", "missing port in address"},
+		{"[fe80::1%lo0]", "missing port in address"},
+		{"[localhost%lo0]", "missing port in address"},
+		{"localhost%lo0", "missing port in address"},
+
+		{"::1", "too many colons in address"},
+		{"fe80::1%lo0", "too many colons in address"},
+		{"fe80::1%lo0:80", "too many colons in address"},
+
+		// Test cases that didn't fail in Go 1
+
+		{"[foo:bar]", "missing port in address"},
+		{"[foo:bar]baz", "missing port in address"},
+		{"[foo]bar:baz", "missing port in address"},
+
+		{"[foo]:[bar]:baz", "too many colons in address"},
+
+		{"[foo]:[bar]baz", "unexpected '[' in address"},
+		{"foo[bar]:baz", "unexpected '[' in address"},
+
+		{"foo]bar:baz", "unexpected ']' in address"},
+	} {
+		if host, port, err := SplitHostPort(tt.hostPort); err == nil {
 			t.Errorf("SplitHostPort(%q) should have failed", tt.hostPort)
 		} else {
 			e := err.(*AddrError)
 			if e.Err != tt.err {
 				t.Errorf("SplitHostPort(%q) = _, _, %q; want %q", tt.hostPort, e.Err, tt.err)
 			}
+			if host != "" || port != "" {
+				t.Errorf("SplitHostPort(%q) = %q, %q, err; want %q, %q, err on failure", tt.hostPort, host, port, "", "")
+			}
 		}
 	}
 }
 
 func TestJoinHostPort(t *testing.T) {
-	for _, tt := range splitJoinTests {
-		if join := JoinHostPort(tt.host, tt.port); join != tt.join {
-			t.Errorf("JoinHostPort(%q, %q) = %q; want %q", tt.host, tt.port, join, tt.join)
+	for _, tt := range []struct {
+		host     string
+		port     string
+		hostPort string
+	}{
+		// Host name
+		{"localhost", "http", "localhost:http"},
+		{"localhost", "80", "localhost:80"},
+
+		// Go-specific host name with zone identifier
+		{"localhost%lo0", "http", "localhost%lo0:http"},
+		{"localhost%lo0", "80", "localhost%lo0:80"},
+
+		// IP literal
+		{"127.0.0.1", "http", "127.0.0.1:http"},
+		{"127.0.0.1", "80", "127.0.0.1:80"},
+		{"::1", "http", "[::1]:http"},
+		{"::1", "80", "[::1]:80"},
+
+		// IP literal with zone identifier
+		{"::1%lo0", "http", "[::1%lo0]:http"},
+		{"::1%lo0", "80", "[::1%lo0]:80"},
+
+		// Go-specific wildcard for host name
+		{"", "http", ":http"}, // Go 1 behavior
+		{"", "80", ":80"},     // Go 1 behavior
+
+		// Go-specific wildcard for service name or transport port number
+		{"golang.org", "", "golang.org:"}, // Go 1 behavior
+		{"127.0.0.1", "", "127.0.0.1:"},   // Go 1 behavior
+		{"::1", "", "[::1]:"},             // Go 1 behavior
+
+		// Opaque service name
+		{"golang.org", "https%foo", "golang.org:https%foo"}, // Go 1 behavior
+	} {
+		if hostPort := JoinHostPort(tt.host, tt.port); hostPort != tt.hostPort {
+			t.Errorf("JoinHostPort(%q, %q) = %q; want %q", tt.host, tt.port, hostPort, tt.hostPort)
 		}
 	}
 }
@@ -520,9 +951,31 @@ var ipAddrScopeTests = []struct {
 	{IP.IsGlobalUnicast, IP{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false},
 	{IP.IsGlobalUnicast, IP{0xff, 0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false},
 	{IP.IsGlobalUnicast, nil, false},
+	{IP.IsPrivate, nil, false},
+	{IP.IsPrivate, IPv4(1, 1, 1, 1), false},
+	{IP.IsPrivate, IPv4(9, 255, 255, 255), false},
+	{IP.IsPrivate, IPv4(10, 0, 0, 0), true},
+	{IP.IsPrivate, IPv4(10, 255, 255, 255), true},
+	{IP.IsPrivate, IPv4(11, 0, 0, 0), false},
+	{IP.IsPrivate, IPv4(172, 15, 255, 255), false},
+	{IP.IsPrivate, IPv4(172, 16, 0, 0), true},
+	{IP.IsPrivate, IPv4(172, 16, 255, 255), true},
+	{IP.IsPrivate, IPv4(172, 23, 18, 255), true},
+	{IP.IsPrivate, IPv4(172, 31, 255, 255), true},
+	{IP.IsPrivate, IPv4(172, 31, 0, 0), true},
+	{IP.IsPrivate, IPv4(172, 32, 0, 0), false},
+	{IP.IsPrivate, IPv4(192, 167, 255, 255), false},
+	{IP.IsPrivate, IPv4(192, 168, 0, 0), true},
+	{IP.IsPrivate, IPv4(192, 168, 255, 255), true},
+	{IP.IsPrivate, IPv4(192, 169, 0, 0), false},
+	{IP.IsPrivate, IP{0xfb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, false},
+	{IP.IsPrivate, IP{0xfc, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, true},
+	{IP.IsPrivate, IP{0xfc, 0xff, 0x12, 0, 0, 0, 0, 0x44, 0, 0, 0, 0, 0, 0, 0, 0}, true},
+	{IP.IsPrivate, IP{0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, true},
+	{IP.IsPrivate, IP{0xfe, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, false},
 }
 
-func name(f interface{}) string {
+func name(f any) string {
 	return runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
 }
 
@@ -538,5 +991,34 @@ func TestIPAddrScope(t *testing.T) {
 		if ok := tt.scope(ip); ok != tt.ok {
 			t.Errorf("%s(%q) = %v, want %v", name(tt.scope), ip, ok, tt.ok)
 		}
+	}
+}
+
+func BenchmarkIPEqual(b *testing.B) {
+	b.Run("IPv4", func(b *testing.B) {
+		benchmarkIPEqual(b, IPv4len)
+	})
+	b.Run("IPv6", func(b *testing.B) {
+		benchmarkIPEqual(b, IPv6len)
+	})
+}
+
+func benchmarkIPEqual(b *testing.B, size int) {
+	ips := make([]IP, 1000)
+	for i := range ips {
+		ips[i] = make(IP, size)
+		rand.Read(ips[i])
+	}
+	// Half of the N are equal.
+	for i := 0; i < b.N/2; i++ {
+		x := ips[i%len(ips)]
+		y := ips[i%len(ips)]
+		x.Equal(y)
+	}
+	// The other half are not equal.
+	for i := 0; i < b.N/2; i++ {
+		x := ips[i%len(ips)]
+		y := ips[(i+1)%len(ips)]
+		x.Equal(y)
 	}
 }
